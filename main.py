@@ -12,7 +12,7 @@ from src.analysis import BacktestAnalyzer  # [NEW]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SOTA Quant System")
-    parser.add_argument('--mode', type=str, required=False, default='train',
+    parser.add_argument('--mode', type=str, required=False, default='download',
                         choices=['download', 'train', 'predict', 'analysis'],
                         help='运行模式: download | train | predict | analysis')
 
@@ -41,3 +41,6 @@ if __name__ == "__main__":
 
         # 2. 计算指标并绘图
         analyzer.analyze_performance()
+
+
+
