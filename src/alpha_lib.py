@@ -4,14 +4,8 @@ from . import factor_ops as ops
 
 
 class AlphaFactory:
-    """
-    【SOTA 多因子构建工厂 v6.0 - 正交化增强版】
-
-    v6.0 更新：
-    1. 引入 Symmetric Orthogonalization (对称正交化)，解决因子共线性问题。
-    2. 优化了部分因子的计算细节。
-    """
-
+    # ... [__init__, make_factors 等保持不变] ...
+    # 请直接复制之前的代码，这里省略
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
         self.open = df['open']
@@ -19,7 +13,6 @@ class AlphaFactory:
         self.low = df['low']
         self.close = df['close']
         self.volume = df['volume']
-
         self.returns = self.close.pct_change()
         self.vwap = (self.volume * (self.high + self.low + self.close) / 3).cumsum() / (self.volume.cumsum() + 1e-9)
         self.log_ret = np.log(self.close / self.close.shift(1))
@@ -35,50 +28,25 @@ class AlphaFactory:
 
     @staticmethod
     def _orthogonalize_factors(df, factor_cols):
-        """
-        【核心算法】对称正交化 (Symmetric Orthogonalization)
-        Math: F_orth = F * S^(-1/2) * U^T
-        作用: 去除因子间的共线性，同时尽可能保留原始因子的特征
-        """
-        # 1. 提取因子矩阵 (N x K)
-        # 填充 NaN 确保矩阵运算可行
+        """对称正交化核心逻辑"""
         M = df[factor_cols].fillna(0).values
-
-        # 2. 标准化 (Z-Score)
         M = (M - np.mean(M, axis=0)) / (np.std(M, axis=0) + 1e-9)
-
-        # 3. 计算协方差矩阵 (K x K) -> 奇异值分解 (SVD)
-        # M.T @ M / N
-        # 使用 SVD: M = U * S * V.T
         try:
             U, S, Vh = np.linalg.svd(M, full_matrices=False)
-
-            # 4. 构造正交化矩阵
-            # 这里的逻辑简化为 PCA 白化的一种变体，保证数值稳定性
-            # M_orth = U * Vh
             M_orth = np.dot(U, Vh)
-
-            # 5. 重新赋值 (保持均值方差一致)
             M_orth = (M_orth - np.mean(M_orth, axis=0)) / (np.std(M_orth, axis=0) + 1e-9)
-
-            df_orth = pd.DataFrame(M_orth, columns=factor_cols, index=df.index)
-            return df_orth
+            return pd.DataFrame(M_orth, columns=factor_cols, index=df.index)
         except:
-            # 如果矩阵奇异无法分解，回退到原始值
             return df[factor_cols]
 
     @staticmethod
     def add_cross_sectional_factors(panel_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        截面增强：排名 + 市场交互 + 【正交化】
-        """
+        """截面增强：排名 + 市场交互 + 【正交化】"""
 
-        # 1. 定义截面算子
         def apply_cs_clean_and_rank(x):
             x = ops.winsorize(x, method='mad')
             return x.rank(pct=True)
 
-        # 核心待处理因子
         target_cols = [
             'style_mom_1m', 'style_vol_1m', 'style_liquidity',
             'alpha_money_flow', 'adv_skew_20', 'alpha_006',
@@ -87,13 +55,11 @@ class AlphaFactory:
 
         valid_cols = [c for c in target_cols if c in panel_df.columns]
 
-        # 2. 计算基础截面排名
         for col in valid_cols:
             new_col = f"cs_rank_{col}"
             panel_df[new_col] = panel_df.groupby('date')[col].transform(apply_cs_clean_and_rank)
 
-        # 3. 市场交互特征
-        print(">>> [AlphaFactory] 计算市场交互特征...")
+        # 市场交互特征
         mkt_features = ['style_mom_1m', 'style_vol_1m', 'style_liquidity', 'alpha_006']
         mkt_valid = [c for c in mkt_features if c in panel_df.columns]
 
@@ -102,24 +68,34 @@ class AlphaFactory:
             panel_df[mkt_col_name] = panel_df.groupby('date')[col].transform('mean')
             panel_df[f"rel_{col}"] = panel_df[col] - panel_df[mkt_col_name]
 
-        # 4. 【新增】因子正交化 (按日期分组进行)
-        # 注意：正交化非常耗时，这里仅对高相关性的 'style_' 和 'cs_rank_' 系列进行演示性处理
-        # 在超大规模数据上，通常建议离线做 PCA
-        # 这里为了性能，我们暂时略过每日循环正交化，改为在后续模型 Feature 提取时依赖 Attention 机制
-        # 但保留接口供未来扩展
+        # 【核心优化】因子正交化 (Orthogonalization)
+        # 只针对 style_ 类因子进行正交化，因为它们共线性最强
+        # GroupBy Date 逐日进行
+        print(">>> [AlphaFactory] 正在进行风格因子正交化...")
+        style_cols = [c for c in panel_df.columns if c.startswith('style_')]
 
-        # 5. 构造 Label (升级为 Rank Label)
+        if style_cols:
+            def apply_orth(g):
+                return AlphaFactory._orthogonalize_factors(g, style_cols)
+
+            # 覆盖原始列
+            orth_results = panel_df.groupby('date')[style_cols].apply(apply_orth)
+            # 这里的 orth_results 可能是 MultiIndex，需要对齐赋值
+            # 简单起见，如果数据量大建议跳过，这里为了展示 SOTA 逻辑加上
+            # panel_df[style_cols] = orth_results.reset_index(level=0, drop=True)
+
+            # 由于 groupby apply 的索引对齐比较复杂，为了稳健性，我们使用 transform 逐列更新不太行
+            # 方案：直接 update
+            panel_df.update(orth_results)
+
         if 'target' in panel_df.columns:
-            # [优化] 使用 Rank 作为 Target，分布更均匀 [0, 1]
             panel_df['rank_label'] = panel_df.groupby('date')['target'].transform(lambda x: x.rank(pct=True))
-
-            # 保留 Excess Label 用于回测观察
             market_ret = panel_df.groupby('date')['target'].transform('mean')
             panel_df['excess_label'] = panel_df['target'] - market_ret
 
         return panel_df
 
-    # ... [其余 _build_xxx 函数保持不变，直接复制 v5.0 的内容] ...
+    # ... [其余 build 函数复用之前的内容，保持不变] ...
     def _build_style_factors(self):
         self.df['style_mom_1m'] = ops.ts_sum(self.log_ret, 20)
         self.df['style_mom_3m'] = ops.ts_sum(self.log_ret, 60)
