@@ -4,15 +4,23 @@ from . import factor_ops as ops
 
 
 class AlphaFactory:
-    # ... [__init__, make_factors 等保持不变] ...
-    # 请直接复制之前的代码，这里省略
+    """
+    【SOTA 多因子构建工厂 v6.1 - 去除未来函数版】
+
+    v6.1 核心修复：
+    1. 移除了 _preprocess_factors 中的全局 winsorize，彻底根除 Look-ahead Bias。
+    2. 在 Rolling Z-Score 后增加了 Clip 操作，防止梯度爆炸。
+    """
+
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
+        # 基础字段映射
         self.open = df['open']
         self.high = df['high']
         self.low = df['low']
         self.close = df['close']
         self.volume = df['volume']
+
         self.returns = self.close.pct_change()
         self.vwap = (self.volume * (self.high + self.low + self.close) / 3).cumsum() / (self.volume.cumsum() + 1e-9)
         self.log_ret = np.log(self.close / self.close.shift(1))
@@ -43,6 +51,7 @@ class AlphaFactory:
     def add_cross_sectional_factors(panel_df: pd.DataFrame) -> pd.DataFrame:
         """截面增强：排名 + 市场交互 + 【正交化】"""
 
+        # 截面层面的去极值是安全的，因为只利用了当天全市场的信息
         def apply_cs_clean_and_rank(x):
             x = ops.winsorize(x, method='mad')
             return x.rank(pct=True)
@@ -55,11 +64,12 @@ class AlphaFactory:
 
         valid_cols = [c for c in target_cols if c in panel_df.columns]
 
+        # 1. 基础截面排名
         for col in valid_cols:
             new_col = f"cs_rank_{col}"
             panel_df[new_col] = panel_df.groupby('date')[col].transform(apply_cs_clean_and_rank)
 
-        # 市场交互特征
+        # 2. 市场交互特征
         mkt_features = ['style_mom_1m', 'style_vol_1m', 'style_liquidity', 'alpha_006']
         mkt_valid = [c for c in mkt_features if c in panel_df.columns]
 
@@ -68,26 +78,13 @@ class AlphaFactory:
             panel_df[mkt_col_name] = panel_df.groupby('date')[col].transform('mean')
             panel_df[f"rel_{col}"] = panel_df[col] - panel_df[mkt_col_name]
 
-        # 【核心优化】因子正交化 (Orthogonalization)
-        # 只针对 style_ 类因子进行正交化，因为它们共线性最强
-        # GroupBy Date 逐日进行
-        print(">>> [AlphaFactory] 正在进行风格因子正交化...")
-        style_cols = [c for c in panel_df.columns if c.startswith('style_')]
+        # 3. 因子正交化 (可选，视性能而定)
+        # style_cols = [c for c in panel_df.columns if c.startswith('style_')]
+        # if style_cols:
+        #     orth_results = panel_df.groupby('date')[style_cols].apply(lambda g: AlphaFactory._orthogonalize_factors(g, style_cols))
+        #     panel_df.update(orth_results)
 
-        if style_cols:
-            def apply_orth(g):
-                return AlphaFactory._orthogonalize_factors(g, style_cols)
-
-            # 覆盖原始列
-            orth_results = panel_df.groupby('date')[style_cols].apply(apply_orth)
-            # 这里的 orth_results 可能是 MultiIndex，需要对齐赋值
-            # 简单起见，如果数据量大建议跳过，这里为了展示 SOTA 逻辑加上
-            # panel_df[style_cols] = orth_results.reset_index(level=0, drop=True)
-
-            # 由于 groupby apply 的索引对齐比较复杂，为了稳健性，我们使用 transform 逐列更新不太行
-            # 方案：直接 update
-            panel_df.update(orth_results)
-
+        # 4. 构造 Label (Rank Label)
         if 'target' in panel_df.columns:
             panel_df['rank_label'] = panel_df.groupby('date')['target'].transform(lambda x: x.rank(pct=True))
             market_ret = panel_df.groupby('date')['target'].transform('mean')
@@ -95,7 +92,7 @@ class AlphaFactory:
 
         return panel_df
 
-    # ... [其余 build 函数复用之前的内容，保持不变] ...
+    # ... [中间的因子构建函数保持不变] ...
     def _build_style_factors(self):
         self.df['style_mom_1m'] = ops.ts_sum(self.log_ret, 20)
         self.df['style_mom_3m'] = ops.ts_sum(self.log_ret, 60)
@@ -171,13 +168,27 @@ class AlphaFactory:
         self.df['ind_smart_money'] = (body_len / total_len) * np.log(self.volume + 1)
 
     def _preprocess_factors(self):
+        """
+        时序预处理 (Time-Series Preprocessing)
+        注意：必须避免使用全序列统计量 (如全局 median/std)，否则会导致未来函数。
+        """
         factor_cols = [c for c in self.df.columns
                        if any(c.startswith(p) for p in ['style_', 'tech_', 'alpha_', 'adv_', 'ind_'])]
+
         self.df.replace([np.inf, -np.inf], np.nan, inplace=True)
         self.df[factor_cols] = self.df[factor_cols].fillna(method='ffill').fillna(0)
+
         for col in factor_cols:
             series = self.df[col]
-            series = ops.winsorize(series, method='mad')
+
+            # 【核心修复】：移除了全局 winsorize，改为 Rolling Z-Score + Clip
+            # 1. Rolling Z-Score: 动态适应市场状态，且只看过去 N 天，绝对安全
             series = ops.zscore(series, window=60)
+
+            # 2. Clip: 替代 Winsorize，简单粗暴地截断极端值，防止梯度爆炸
+            # 4倍标准差之外通常都是异常值
+            series = series.clip(-4, 4)
+
             self.df[col] = series
+
         self.df[factor_cols] = self.df[factor_cols].fillna(0)
