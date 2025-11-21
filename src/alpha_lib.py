@@ -5,14 +5,11 @@ from . import factor_ops as ops
 
 class AlphaFactory:
     """
-    【SOTA 多因子构建工厂 v5.0 - 工业级增强版】
+    【SOTA 多因子构建工厂 v5.1 - 市场交互增强版】
 
-    包含：
-    1. Style Factors (Barra)
-    2. Technical Factors (TA-Lib)
-    3. SOTA Alphas (WorldQuant)
-    4. Advanced Factors (High Moments)
-    5. [NEW] Industrial Factors (Volatility Structure, Microstructure, Behavioral)
+    v5.1 更新：
+    在截面分析中增加 Market Mean (市场均值) 和 Relative Features (相对特征)，
+    解决单变量模型缺失宏观/板块视角的问题。
     """
 
     def __init__(self, df: pd.DataFrame):
@@ -32,43 +29,67 @@ class AlphaFactory:
         self._build_technical_factors()
         self._build_sota_alphas()
         self._build_advanced_factors()
-        self._build_industrial_factors()  # [新增]
+        self._build_industrial_factors()
         self._preprocess_factors()
         return self.df
 
     @staticmethod
     def add_cross_sectional_factors(panel_df: pd.DataFrame) -> pd.DataFrame:
-        """截面增强 (包含新增的核心因子)"""
+        """
+        截面增强：排名 + 市场交互
+        """
 
+        # 1. 基础清洗与排名 (Rank)
         def apply_cs_clean_and_rank(x):
             x = ops.winsorize(x, method='mad')
             return x.rank(pct=True)
 
-        # 扩充核心因子池，加入新的工业因子进行横向比较
+        # 核心因子列表
         target_cols = [
             'style_mom_1m', 'style_vol_1m', 'style_liquidity',
             'alpha_money_flow', 'adv_skew_20', 'alpha_006',
-            'ind_yang_zhang_vol', 'ind_roll_spread', 'ind_max_ret'  # 新增
+            'ind_yang_zhang_vol', 'ind_roll_spread', 'ind_max_ret'
         ]
 
         valid_cols = [c for c in target_cols if c in panel_df.columns]
 
+        # 计算截面排名 (CS Rank)
         for col in valid_cols:
             new_col = f"cs_rank_{col}"
             panel_df[new_col] = panel_df.groupby('date')[col].transform(apply_cs_clean_and_rank)
 
+        # ----------------------------------------------------------------------
+        # 【新增】2. 市场交互特征 (Market Interaction)
+        # 解决 PatchTST "看不见大盘" 的问题
+        # ----------------------------------------------------------------------
+        print(">>> [AlphaFactory] 计算市场交互特征 (Market Interaction)...")
+
+        # 我们选取最具代表性的几个维度来刻画"大盘状态"
+        # 动量(Trend), 波动(Risk), 流动性(Sentiment)
+        mkt_features = ['style_mom_1m', 'style_vol_1m', 'style_liquidity', 'alpha_006']
+        mkt_valid = [c for c in mkt_features if c in panel_df.columns]
+
+        # 计算全市场当天的平均值 -> 代表 "大盘指数" 的特征
+        # transform('mean') 会将均值广播回每一行，让每个样本都能看到"当天大盘的情况"
+        for col in mkt_valid:
+            mkt_col_name = f"mkt_mean_{col}"
+            panel_df[mkt_col_name] = panel_df.groupby('date')[col].transform('mean')
+
+            # 计算 相对强弱 (Relative Strength)
+            # 个股因子 - 市场均值。这比单纯的 Rank 包含了更多的幅度信息。
+            rel_col_name = f"rel_{col}"
+            panel_df[rel_col_name] = panel_df[col] - panel_df[mkt_col_name]
+
+        # ----------------------------------------------------------------------
+
+        # 3. 构造超额收益 Label
         if 'target' in panel_df.columns:
             market_ret = panel_df.groupby('date')['target'].transform('mean')
             panel_df['excess_label'] = panel_df['target'] - market_ret
 
         return panel_df
 
-    # ... [前四个 build 函数保持不变，省略以节省篇幅，请直接复制之前的代码] ...
-    # _build_style_factors
-    # _build_technical_factors
-    # _build_sota_alphas
-    # _build_advanced_factors
-    # 这里为了完整性，简略写出占位，实际使用请保留原内容
+    # ... [以下因子构建代码保持不变，请保留原有的 build 函数] ...
     def _build_style_factors(self):
         self.df['style_mom_1m'] = ops.ts_sum(self.log_ret, 20)
         self.df['style_mom_3m'] = ops.ts_sum(self.log_ret, 60)
@@ -119,71 +140,26 @@ class AlphaFactory:
         rolling_vol = ops.ts_std(self.returns, vol_window)
         self.df['adv_vol_of_vol'] = ops.ts_std(rolling_vol, 20)
 
-    # ==========================================================================
-    # 5. [NEW] 工业级实战因子 (Industrial Practice Factors)
-    # ==========================================================================
     def _build_industrial_factors(self):
-        """
-        【新增】基于日线数据挖掘的高效能因子
-        来源：顶级期刊 (Journal of Finance) & 机构内部分享
-        """
-
-        # --- [1. Yang-Zhang Volatility] 杨-张波动率 ---
-        # [逻辑] 相比传统的收盘价标准差，YZ波动率利用了 Open/High/Low/Close 信息，
-        # 是目前日线级别最高效的波动率估计量。
-        # 它可以捕捉到跳空缺口(Gap)和日内振幅(Range)的风险。
-        # 公式较为复杂，包含过夜波动(Overnight)和日内波动(Trading)两部分。
-
-        # 1. 过夜波动 (Close_prev -> Open)
         o_c_lag = np.log(self.open / self.close.shift(1))
-        # 2. 日内开收波动 (Open -> Close)
         c_o = np.log(self.close / self.open)
-        # 3. 日内极值波动 (Rogers-Satchell proxy)
         rs_vol = np.log(self.high / self.close) * np.log(self.high / self.open) + \
                  np.log(self.low / self.close) * np.log(self.low / self.open)
-
-        # 窗口 N
         N = 20
-        # 因子 k = 0.34 / (1.34 + (N+1)/(N-1))，简化取 0.34
         k = 0.34
-
         sigma_open = ops.ts_std(o_c_lag, N) ** 2
         sigma_close = ops.ts_std(c_o, N) ** 2
         sigma_rs = ops.ts_mean(rs_vol, N)
-
-        # 结果开根号
         self.df['ind_yang_zhang_vol'] = np.sqrt(sigma_open + k * sigma_close + (1 - k) * sigma_rs)
 
-        # --- [2. Roll Spread] 罗尔价差 (流动性代理) ---
-        # [逻辑] 著名的 Roll Model (1984)。
-        # 价格变化的自协方差与有效价差(Effective Spread)负相关。
-        # Spread = 2 * sqrt(-Cov(Delta P_t, Delta P_{t-1}))
-        # 如果自协方差 > 0，则 Spread 设为 0。
-        # 高价差意味着低流动性，通常预期收益较高(流动性补偿)，但也可能意味着崩盘风险。
         delta_p = self.close.diff()
         cov_delta = ops.ts_cov(delta_p, delta_p.shift(1), 20)
-        # 只取负的部分开根号，正的部分置0
         cov_delta[cov_delta > 0] = 0
         self.df['ind_roll_spread'] = 2 * np.sqrt(-cov_delta + 1e-9)
 
-        # --- [3. MAX Factor] 彩票效应因子 ---
-        # [逻辑] Bali, Cakici, and Whitelaw (2011).
-        # 过去一个月内最大的单日涨幅。
-        # 散户喜欢买这种"彩票股"，导致股价被高估。因此，MAX 值越大，未来预期收益越低 (Alpha 为负)。
         self.df['ind_max_ret'] = ops.ts_max(self.returns, 20)
-
-        # --- [4. Volume Coefficient of Variation] 成交量变异系数 ---
-        # [逻辑] 衡量成交量的稳定性。
-        # 如果成交量忽大忽小(CV高)，说明筹码松动，分歧巨大；
-        # 如果成交量稳定(CV低)，说明控盘良好。
         self.df['ind_vol_cv'] = ops.ts_std(self.volume, 20) / (ops.ts_mean(self.volume, 20) + 1e-9)
 
-        # --- [5. Smart Money Factor] 聪明钱因子 (S-Factor) ---
-        # [逻辑] 改进版的资金流。
-        # 如果价格上涨时成交量主要集中在前半小时(聪明钱进场)，下跌时成交量集中在尾盘(散户恐慌)。
-        # 由于没有分钟数据，我们用日线近似：
-        # `|Open - Close| / Volume` 类似于 Amihud，但我们关注的是 `(Close - Open) / (High - Low)` 这种实体占比与量的关系。
-        # 这是一个简化版的 "实体率 * 换手率"。
         body_len = (self.close - self.open).abs()
         total_len = (self.high - self.low) + 1e-9
         self.df['ind_smart_money'] = (body_len / total_len) * np.log(self.volume + 1)
