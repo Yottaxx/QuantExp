@@ -2,202 +2,243 @@ import torch
 import pandas as pd
 import numpy as np
 import os
-import glob
 import matplotlib.pyplot as plt
-from tqdm import tqdm
 from scipy.stats import spearmanr
-from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
 from .config import Config
 from .model import PatchTSTForStock
 from .data_provider import DataProvider
 
 
 class BacktestAnalyzer:
-    def __init__(self, start_date='2024-01-01', end_date='2025-11-20'):
+    def __init__(self, start_date='2024-01-01', end_date='2025-12-31'):
         self.start_date = pd.to_datetime(start_date)
         self.end_date = pd.to_datetime(end_date)
         self.device = Config.DEVICE
         self.model_path = f"{Config.OUTPUT_DIR}/final_model"
-
-    def load_model(self):
-        print(f"正在加载模型: {self.model_path}")
-        self.model = PatchTSTForStock.from_pretrained(self.model_path).to(self.device)
-        self.model.eval()
+        self.results_df = None
 
     def generate_historical_predictions(self):
         """
-        核心逻辑：
-        不使用 for date in dates (太慢)，
-        而是 for stock in stocks (批量处理)，一次性生成该股票在整个回测区间的预测值，
-        最后再合并成一张大表。
+        全量回溯推理：
+        加载全历史数据，按日期滚动的形式，对每一天全市场的股票进行打分。
         """
-        if not hasattr(self, 'model'):
-            self.load_model()
+        print("\n" + "=" * 60)
+        print(">>> 启动全量截面分析 (Full Cross-Sectional Analysis)")
+        print("=" * 60)
 
-        files = glob.glob(os.path.join(Config.DATA_DIR, "*.parquet"))
-        all_predictions = []
+        # 1. 加载模型
+        if not os.path.exists(self.model_path):
+            print(f"❌ 模型未找到: {self.model_path}")
+            return
 
-        print(f"正在进行全市场回溯预测 ({self.start_date.date()} - {self.end_date.date()})...")
+        print(f"正在加载模型: {self.model_path}")
+        model = PatchTSTForStock.from_pretrained(self.model_path).to(self.device)
+        model.eval()
 
-        # 我们可以只抽样部分股票进行演示分析，全市场跑需要较长时间
-        # files = files[:500]
+        # 2. 加载全量 Panel 数据
+        # 使用 mode='train'，因为我们需要 Target (真实收益) 来计算 IC，所以剔除最后几天无 Target 的数据是正确的
+        print("正在加载全市场 Panel 数据 (用于验证)...")
+        panel_df, feature_cols = DataProvider.load_and_process_panel(mode='train')
 
+        # 3. 时间过滤
+        mask = (panel_df['date'] >= self.start_date) & (panel_df['date'] <= self.end_date)
+        df_sub = panel_df[mask].copy()
+
+        if df_sub.empty:
+            print("❌ 所选时间段无数据")
+            return
+
+        print(f"分析区间: {self.start_date.date()} ~ {self.end_date.date()}")
+        print(f"样本数量: {len(df_sub)} 行")
+
+        # 4. 按日期分组进行批量推理
+        # 这样可以模拟每天“面对全市场股票”的选股场景
+        date_groups = df_sub.groupby('date')
+
+        predictions = []
+
+        print("正在进行历史回溯推理...")
         with torch.no_grad():
-            for fpath in tqdm(files):
-                try:
-                    stock_code = os.path.basename(fpath).replace('.parquet', '')
-                    df = pd.read_parquet(fpath)
+            for date, group in tqdm(date_groups, desc="Daily Inference"):
+                # 跳过样本太少的日期
+                if len(group) < 10: continue
 
-                    # 1. 基础处理 (计算因子)
-                    if len(df) < 100: continue
-                    df_proc, factor_cols = DataProvider.process_single_stock(df)
+                # 检查每只股票是否有足够历史窗口
+                # 为了速度，这里假设 DataProvider 已经保证了前面有足够的数据填充
+                # 严谨的做法是去原始 panel_df 里找前 30 天
 
-                    # 2. 筛选时间范围 (需要多留出 Context_Len 的数据用于生成第一天的预测)
-                    mask = (df_proc.index >= self.start_date - pd.Timedelta(days=60)) & (df_proc.index <= self.end_date)
-                    df_sub = df_proc[mask].copy()
+                # 我们需要构建 tensor: [Batch, Seq_Len, Features]
+                # 这里有一个难点：df_sub 切片可能导致无法获取前序窗口
+                # 优化方案：我们直接遍历 panel_df，但只在目标日期输出结果
 
-                    if len(df_sub) < Config.CONTEXT_LEN: continue
+                pass  # 逻辑优化见下文
 
-                    # 3. 准备批量推理数据
-                    # 我们需要构建滑动窗口: [T-30, T], [T-29, T+1] ...
-                    # 为了速度，手动构建 Numpy 视图
-                    data_values = df_sub[factor_cols].values
-                    scaler = StandardScaler()
-                    data_values = scaler.fit_transform(data_values)
+        # --- 优化后的推理逻辑 ---
+        # 直接利用 panel_df 的连续性
 
-                    # 使用 stride_tricks 高效切片
-                    # Shape: [Num_Days, Context_Len, Features]
-                    # 这种方法比一个个 append 快 100倍
-                    num_samples = len(data_values) - Config.CONTEXT_LEN
-                    if num_samples <= 0: continue
+        results = []
+        unique_dates = df_sub['date'].unique()
 
-                    # 构造 Tensor (注意显存，如果显存不够需要分 Batch)
-                    # 这里为了演示简单，直接转 Tensor (对于单只股票通常没问题)
-                    # 实际操作：我们需要对应每一天的 Input
-                    input_list = []
-                    valid_dates = []
-                    valid_targets = []
+        # 预处理：将 panel_df 设为 (code, date) 索引以便快速查找窗口
+        # 但为了效率，我们采用“滑动窗口生成器”模式
 
-                    # 对应的日期是窗口的最后一天
-                    dates = df_sub.index[Config.CONTEXT_LEN:]
-                    targets = df_sub['target'].values[Config.CONTEXT_LEN:]
+        # 实际上，为了简化代码并保证准确性，我们可以直接利用 'code' group
+        # 对每只股票，找出它在分析区间内的所有时间点
 
-                    # 滑动窗口生成
-                    for i in range(num_samples):
-                        window = data_values[i: i + Config.CONTEXT_LEN]
-                        input_list.append(window)
-                        valid_dates.append(dates[i])
-                        valid_targets.append(targets[i])
+        # 更加工程化的做法：
+        # 我们复用 DataProvider 的逻辑，但这次我们要记录预测值和真实值
 
-                    # 转 Batch Tensor
-                    input_tensor = torch.tensor(np.array(input_list), dtype=torch.float32).to(self.device)
+        # 让我们用一种更直接的方法：
+        # 遍历所有股票，生成 Tensor，预测，然后把结果拼回去
 
-                    # 4. 模型推理
-                    # 如果 input_tensor 很大，建议这里再拆 mini-batch
-                    outputs = self.model(past_values=input_tensor)
-                    scores = outputs.logits.squeeze().cpu().numpy()
+        codes = df_sub['code'].unique()
 
-                    # 5. 收集结果
-                    # 如果 scores 是标量(只有1天)，转为数组
-                    if scores.ndim == 0: scores = [scores]
+        # 提取特征矩阵和 Target
+        # 注意：这里为了演示，我们简化处理，直接用当前行作为 Input (假设已经包含了时序特征)
+        # 实际上 PatchTST 需要 [Batch, 30, F]
 
-                    for date, score, true_ret in zip(valid_dates, scores, valid_targets):
-                        if date >= self.start_date:  # 再次确保日期在回测区间内
-                            all_predictions.append({
-                                'date': date,
-                                'code': stock_code,
-                                'score': float(score),
-                                'true_return': float(true_ret)
-                            })
+        # 重新利用 groupby code
+        full_grouped = panel_df.groupby('code')
 
-                except Exception as e:
-                    # print(f"Error {stock_code}: {e}")
-                    continue
+        batch_inputs = []
+        batch_metas = []  # (date, code, target)
 
-        self.df_res = pd.DataFrame(all_predictions)
-        print(f"回溯完成，生成预测记录 {len(self.df_res)} 条。")
-        return self.df_res
+        print("正在构建时序窗口...")
+        for code, group in tqdm(full_grouped, desc="Windowing"):
+            # 筛选该股票在回测区间内的数据
+            in_range_indices = group[(group['date'] >= self.start_date) & (group['date'] <= self.end_date)].index
+
+            for idx in in_range_indices:
+                # 获取行号位置
+                loc = group.index.get_loc(idx)
+
+                # 如果前面没有足够 30 天数据，跳过
+                if loc < Config.CONTEXT_LEN: continue
+
+                # 截取窗口 [loc-30 : loc]
+                # 注意：iloc 切片是左闭右开，所以是 loc-Context_Len : loc
+                # 但我们需要包含 loc 这一天的数据作为输入序列的最后一天吗？
+                # PatchTST 的输入是 Past Values。
+                # 假设我们要预测 T+1，我们输入 T-29 ~ T。
+                # 这里的 idx 就是 T。
+
+                window = group.iloc[loc - Config.CONTEXT_LEN + 1: loc + 1]
+                if len(window) != Config.CONTEXT_LEN: continue
+
+                feature_val = window[feature_cols].values.astype(np.float32)
+
+                target_val = group.loc[idx, 'excess_label']  # 使用超额收益作为验证目标
+                if pd.isna(target_val): target_val = group.loc[idx, 'target']
+
+                batch_inputs.append(feature_val)
+                batch_metas.append({
+                    'date': group.loc[idx, 'date'],
+                    'code': code,
+                    'label': target_val
+                })
+
+                # 显存控制：每 2048 个样本推一次
+                if len(batch_inputs) >= 2048:
+                    self._run_batch(model, batch_inputs, batch_metas, results)
+                    batch_inputs = []
+                    batch_metas = []
+
+        # 处理剩余的
+        if batch_inputs:
+            self._run_batch(model, batch_inputs, batch_metas, results)
+
+        self.results_df = pd.DataFrame(results)
+        print(f"推理完成，共生成 {len(self.results_df)} 条预测记录。")
+
+    def _run_batch(self, model, inputs, metas, results_list):
+        tensor = torch.tensor(np.array(inputs), dtype=torch.float32).to(self.device)
+        scores = model(past_values=tensor).logits.squeeze().detach().cpu().numpy()
+        if scores.ndim == 0: scores = [scores]
+
+        for i, score in enumerate(scores):
+            rec = metas[i]
+            rec['score'] = float(score)
+            results_list.append(rec)
 
     def analyze_performance(self):
         """
-        工业级分析：Rank IC, ICIR, 分层收益
+        核心：计算 IC, ICIR, 分层收益
         """
-        if self.df_res is None or self.df_res.empty:
-            print("无预测数据，请先运行 generate_historical_predictions")
+        if self.results_df is None or self.results_df.empty:
+            print("❌ 无预测数据")
             return
 
-        print("\n正在计算绩效指标...")
-        df = self.df_res.sort_values(['date', 'score'], ascending=[True, False])
+        df = self.results_df.sort_values(['date', 'score'], ascending=[True, False])
 
-        # --- 1. IC 分析 (Information Coefficient) ---
-        # 每天计算一次 预测分 和 真实收益 的相关系数
+        print("\n正在计算截面绩效指标...")
+
+        # 1. Rank IC (相关性)
+        # 每天计算 预测分(score) 和 真实下期收益(label) 的 Spearman 相关系数
         daily_ic = df.groupby('date').apply(
-            lambda x: spearmanr(x['score'], x['true_return'])[0]
+            lambda x: spearmanr(x['score'], x['label'])[0]
         )
 
-        rank_ic_mean = daily_ic.mean()
-        rank_ic_std = daily_ic.std()
-        icir = rank_ic_mean / (rank_ic_std + 1e-9)
-        win_rate = (daily_ic > 0).sum() / len(daily_ic)
+        ic_mean = daily_ic.mean()
+        ic_std = daily_ic.std()
+        icir = ic_mean / (ic_std + 1e-9) * np.sqrt(252)  # 年化 ICIR
 
-        print(f"{'=' * 30}")
-        print(f"【IC 绩效报告】")
-        print(f"Rank IC (均值): {rank_ic_mean:.4f}")
-        print(f"ICIR (稳定性):  {icir:.4f}")
-        print(f"IC 胜率:       {win_rate:.2%}")
-        print(f"{'=' * 30}")
+        print("-" * 40)
+        print(f"📊 【因子绩效报告 (IC Analysis)】")
+        print("-" * 40)
+        print(f"Rank IC (均值) : {ic_mean:.4f} (标准: >0.05 优秀)")
+        print(f"ICIR (年化)    : {icir:.4f}   (标准: >3.0 优秀)")
+        print(f"IC 胜率        : {(daily_ic > 0).mean():.2%}")
+        print("-" * 40)
 
-        # --- 2. 分层回测 (Group Test) ---
-        # 每天将股票分为 5 组 (Quintiles)
-        def get_group_ret(day_df):
-            # pd.qcut 可能会报错如果数据太少，这里用简单的切片
-            n = len(day_df)
-            top_n = int(n * 0.2)  # Top 20%
-            bottom_n = int(n * 0.2)  # Bottom 20%
+        # 2. 分层回测 (Layered Backtest)
+        # 每天把股票分成 5 组 (Quintiles)
+        def get_layer_ret(g):
+            # qcut 可能会因为数据少报错，用 numpy split
+            try:
+                # 按分数降序，分为 5 组
+                # 0: Top (分数最高), 4: Bottom (分数最低)
+                labels = pd.qcut(g['score'], 5, labels=False, duplicates='drop')
+                # qcut 默认是升序 (0是最小)，我们需要反过来或者注意一下
+                # score 越大越好，所以 qcut 结果 4 是 Top，0 是 Bottom
+                g['group'] = labels
+                return g.groupby('group')['label'].mean()
+            except:
+                return None
 
-            if top_n == 0: return pd.Series([0, 0, 0], index=['top', 'bottom', 'ls'])
+        layer_ret = df.groupby('date').apply(get_layer_ret)
 
-            # 假设按 score 降序排好了
-            top_ret = day_df.iloc[:top_n]['true_return'].mean()
-            bottom_ret = day_df.iloc[-bottom_n:]['true_return'].mean()
+        # layer_ret 列名是 0,1,2,3,4。其中 4 是高分层(Top)，0 是低分层(Bottom)
+        # 计算累积收益
+        cum_ret = (1 + layer_ret).cumprod()
 
-            return pd.Series({
-                'top': top_ret,
-                'bottom': bottom_ret,
-                'ls': top_ret - bottom_ret  # 多空收益
-            })
+        # 多空收益 (Top - Bottom)
+        long_short = (1 + (layer_ret[4] - layer_ret[0])).cumprod()
 
-        daily_group_ret = df.groupby('date').apply(get_group_ret)
+        # 3. 绘图
+        plt.figure(figsize=(14, 8))
 
-        # 计算累计收益 (单利累加近似，或者复利 (1+r).cumprod())
-        # 这里用累加展示 Log Returns 概念，或者简单累积
-        cum_ret = daily_group_ret.cumsum()
-
-        self.plot_analysis(daily_ic, cum_ret)
-
-    def plot_analysis(self, daily_ic, cum_ret):
-        """绘制专业图表"""
-        plt.figure(figsize=(12, 10))
-
-        # 图1: 累计收益曲线
         plt.subplot(2, 1, 1)
-        plt.plot(cum_ret.index, cum_ret['top'], label='Top 20% (Long)', color='red')
-        plt.plot(cum_ret.index, cum_ret['bottom'], label='Bottom 20% (Short)', color='green', alpha=0.5)
-        plt.plot(cum_ret.index, cum_ret['ls'], label='Long-Short (Alpha)', color='blue', linewidth=2)
-        plt.title('Group Backtest Performance (Cumulative Return)')
-        plt.legend()
+        for i in range(5):
+            label = "Top 20% (Long)" if i == 4 else f"Group {i}"
+            label = "Bottom 20% (Short)" if i == 0 else label
+            color = 'red' if i == 4 else 'green' if i == 0 else 'grey'
+            alpha = 1.0 if i in [0, 4] else 0.3
+            plt.plot(cum_ret.index, cum_ret[i], label=label, color=color, alpha=alpha)
+
+        plt.plot(long_short.index, long_short, label='Long-Short (Alpha)', color='blue', linestyle='--', linewidth=2)
+        plt.title('Layered Backtest (Cumulative Excess Return)')
+        plt.legend(loc='upper left')
         plt.grid(True, alpha=0.3)
 
-        # 图2: 每日 IC 分布
         plt.subplot(2, 1, 2)
-        plt.bar(daily_ic.index, daily_ic.values, color='gray', alpha=0.6, label='Daily IC')
-        plt.axhline(daily_ic.mean(), color='red', linestyle='--', label=f'Mean IC: {daily_ic.mean():.3f}')
-        plt.title('Daily Rank IC')
+        plt.bar(daily_ic.index, daily_ic.values, color='orange', alpha=0.5, label='Daily IC')
+        plt.axhline(daily_ic.mean(), color='red', linestyle='--', label=f'Mean IC: {ic_mean:.3f}')
+        plt.title('Daily Rank IC Series')
         plt.legend()
         plt.grid(True, alpha=0.3)
 
-        save_path = os.path.join(Config.OUTPUT_DIR, "analysis_report.png")
+        save_path = os.path.join(Config.OUTPUT_DIR, "cross_section_analysis.png")
         plt.tight_layout()
         plt.savefig(save_path)
-        print(f"分析图表已保存至: {save_path}")
-        # plt.show() # 如果在服务器运行请注释掉
+        print(f"📈 截面分析图表已保存至: {save_path}")

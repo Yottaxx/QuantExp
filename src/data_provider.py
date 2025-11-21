@@ -21,10 +21,7 @@ class DataProvider:
     _vpn_lock = threading.Lock()
     _last_switch_time = 0
 
-    # --------------------------------------------------------------------------
-    # PART 1: 下载模块 (保持不变)
-    # --------------------------------------------------------------------------
-
+    # ... [PART 1 下载模块保持不变] ...
     @staticmethod
     def _setup_proxy_env():
         proxy_url = "http://127.0.0.1:7890"
@@ -68,7 +65,7 @@ class DataProvider:
     @staticmethod
     def download_data():
         """下载全市场数据"""
-        print(">>> [Phase 1] 启动数据下载...")
+        print(">>> [Phase 1] 启动数据下载 (每日更新模式)...")
         DataProvider._setup_proxy_env()
 
         if not os.path.exists(Config.DATA_DIR): os.makedirs(Config.DATA_DIR)
@@ -80,15 +77,26 @@ class DataProvider:
             print("❌ 无法获取股票列表，请检查网络/VPN")
             return
 
+        print(">>> 正在检查数据新鲜度...")
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        existing_fresh = set()
+
         files = os.listdir(Config.DATA_DIR)
-        existing = {f.replace(".parquet", "") for f in files if
-                    f.endswith(".parquet") and os.path.getsize(os.path.join(Config.DATA_DIR, f)) > 1024}
-        todo = list(set(codes) - existing)
+        for fname in files:
+            if fname.endswith(".parquet"):
+                fpath = os.path.join(Config.DATA_DIR, fname)
+                if os.path.getsize(fpath) > 1024:
+                    mtime = os.path.getmtime(fpath)
+                    file_date = datetime.date.fromtimestamp(mtime).strftime("%Y-%m-%d")
+                    if file_date == today_str:
+                        existing_fresh.add(fname.replace(".parquet", ""))
+
+        todo = list(set(codes) - existing_fresh)
         todo.sort()
 
-        print(f"📊 任务: 总数 {len(codes)} | 待下载 {len(todo)}")
+        print(f"📊 任务: 总数 {len(codes)} | 今日已新 {len(existing_fresh)} | 待更新 {len(todo)}")
         if not todo:
-            print("✅ 数据已最新。")
+            print("✅ 数据已是最新，无需下载。")
             return
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
@@ -97,53 +105,28 @@ class DataProvider:
                 pass
         print("下载完成。")
 
-    # --------------------------------------------------------------------------
-    # PART 2: 核心重构 - 内存 Panel 处理 (含 Phase 2 过滤)
-    # --------------------------------------------------------------------------
-
+    # ... [PART 2 load_and_process_panel 等保持不变] ...
     @staticmethod
     def _filter_universe(panel_df):
-        """
-        【Phase 2 核心】动态宇宙过滤
-        目的：清洗掉不适合交易的脏数据，防止模型学坏。
-        注意：必须在时序因子计算完成后调用，但在截面因子计算前调用。
-        """
         print(">>> [Filtering] 正在执行动态股票池过滤...")
         original_len = len(panel_df)
-
-        # 1. 剔除停牌 (Volume = 0)
-        # 停牌期间无法交易，且复牌后往往会有剧烈跳空，是极大的噪音
         panel_df = panel_df[panel_df['volume'] > 0]
-
-        # 2. 剔除垃圾股/准退市股 (Close < 2.0)
-        # 低价股往往伴随流动性陷阱或退市风险，量化策略应尽量避开
         panel_df = panel_df[panel_df['close'] >= 2.0]
-
-        # 3. 剔除上市不满 60 天的次新股
-        # 逻辑：按 code 分组，计算累计交易天数。前 60 天的数据不稳，剔除。
-        # 使用 cumcount() 高效生成序号
         panel_df['list_days'] = panel_df.groupby('code').cumcount()
         panel_df = panel_df[panel_df['list_days'] > 60]
-
-        # 清理临时列
         panel_df = panel_df.drop(columns=['list_days'])
-
         new_len = len(panel_df)
         print(f"过滤完成。移除样本: {original_len - new_len} ({1 - new_len / original_len:.2%})")
         return panel_df
 
     @staticmethod
-    def load_and_process_panel():
-        """
-        全内存加载与处理核心函数
-        """
-        print("\n>>> [Phase 2] 开始构建全内存 Panel 数据...")
+    def load_and_process_panel(mode='train'):
+        print(f"\n>>> [Phase 2] 开始构建全内存 Panel 数据 (Mode: {mode})...")
 
         files = glob.glob(os.path.join(Config.DATA_DIR, "*.parquet"))
         if not files:
             raise ValueError("没有找到数据文件，请先运行 download")
 
-        # --- Step 1: 并行读取 ---
         print(f"正在加载 {len(files)} 个文件到内存...")
 
         def _read_helper(f):
@@ -156,88 +139,72 @@ class DataProvider:
                 return None
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            # 使用 list() 强制执行 map
             results = list(tqdm(executor.map(_read_helper, files), total=len(files), desc="Reading"))
 
-        # 过滤无效数据，合并
         data_frames = [df for df in results if df is not None and len(df) > Config.CONTEXT_LEN + 10]
         if not data_frames: raise ValueError("有效数据为空")
 
         print("正在合并 Panel DataFrame...")
         panel_df = pd.concat(data_frames)
-        del data_frames  # 释放内存
+        del data_frames
 
-        # 重置索引，确保 'date' 是列
         panel_df = panel_df.reset_index().sort_values(['code', 'date'])
 
-        # --- Step 2: 计算时序因子 (TS Factors) ---
-        # 注意：必须在过滤之前计算，否则因为某些天被剔除导致 rolling 计算中断
         print("正在计算时序因子 (TS Factors)...")
 
         def _process_ts(df_sub):
             factory = AlphaFactory(df_sub)
             return factory.make_factors()
 
-        # 优化：只对需要的列进行 groupby 运算，防止内存爆炸
-        # group_keys=False 避免索引层级增加
         panel_df = panel_df.groupby('code', group_keys=False).apply(_process_ts)
 
-        # --- Step 3: 构造 Label ---
-        # 预测未来 N 天收益
         print("正在构造预测目标 (Future Returns)...")
         panel_df['target'] = panel_df.groupby('code')['close'].shift(-Config.PRED_LEN) / panel_df['close'] - 1
 
-        # 剔除 label 为空的行 (最后 N 天)
-        panel_df.dropna(subset=['target'], inplace=True)
+        if mode == 'train':
+            print("训练模式：剔除无标签的尾部数据...")
+            panel_df.dropna(subset=['target'], inplace=True)
+        else:
+            print("预测模式：保留尾部数据用于推理...")
 
-        # --- Step 4: 执行动态过滤 (Filtering) ---
-        # 【关键】在这里切除垃圾数据，确保后续的截面排名只在优质股票中进行
         panel_df = DataProvider._filter_universe(panel_df)
 
-        # --- Step 5: 计算截面因子 & 超额收益 Label ---
-        # 此时 panel_df 已经很干净了，计算 cs_rank 会更准确
-        # 重置索引为 date，方便 AlphaFactory 处理
         panel_df = panel_df.set_index('date')
         panel_df = AlphaFactory.add_cross_sectional_factors(panel_df)
 
-        # --- Step 6: 最终清洗 ---
         feature_cols = [c for c in panel_df.columns
                         if any(c.startswith(p) for p in ['style_', 'tech_', 'alpha_', 'adv_', 'cs_rank_'])]
 
         print(f"因子工程完成。特征维度: {len(feature_cols)}")
-        # 填充 NaN
         panel_df[feature_cols] = panel_df[feature_cols].fillna(0)
 
-        # 重置索引回来，方便后续排序
         panel_df = panel_df.reset_index()
-
         return panel_df, feature_cols
+
+    # --------------------------------------------------------------------------
+    # PART 3: 核心重构 - 数据集切分 (修复验证集泄露)
+    # --------------------------------------------------------------------------
 
     @staticmethod
     def make_dataset(panel_df, feature_cols):
         """
-        将 Panel DataFrame 转换为 PyTorch 友好的 Dataset
+        转换 Dataset (仅用于训练)
         """
-        print(">>> [Phase 3] 转换 Dataset...")
-
-        # 1. 排序: 必须按 (code, date) 排序以保证滑动窗口正确
+        print(">>> [Phase 3] 转换 Dataset (时间序列切分)...")
+        # 确保按时间排序
         panel_df = panel_df.sort_values(['code', 'date'])
 
-        # 2. 提取 numpy 数组 (使用 float32 压缩内存)
         feature_matrix = panel_df[feature_cols].values.astype(np.float32)
-
-        # 【关键】使用 'excess_label' (超额收益) 作为训练目标
-        # 如果没有 excess_label，回退到 target
         target_col = 'excess_label' if 'excess_label' in panel_df.columns else 'target'
-        print(f"使用训练目标: {target_col}")
-        target_array = panel_df[target_col].values.astype(np.float32)
+        target_array = panel_df[target_col].fillna(0).values.astype(np.float32)
 
-        # 3. 构建样本索引
         codes = panel_df['code'].values
+        # 计算每只股票的切分点
         code_changes = np.where(codes[:-1] != codes[1:])[0] + 1
         start_indices = np.concatenate(([0], code_changes))
         end_indices = np.concatenate((code_changes, [len(codes)]))
 
+        # 生成所有合法样本索引
         valid_indices = []
         seq_len = Config.CONTEXT_LEN
         stride = 5
@@ -245,28 +212,75 @@ class DataProvider:
         for start, end in zip(start_indices, end_indices):
             length = end - start
             if length <= seq_len: continue
-
-            # 滑动窗口切片
             for i in range(start, end - seq_len + 1, stride):
                 valid_indices.append(i)
 
-        print(f"生成的样本数量: {len(valid_indices)}")
+        print(f"总样本数量: {len(valid_indices)}")
 
-        def gen():
+        # 【核心修复】时间序列切分 (Time-Series Split)
+        # 逻辑：为了防止滑动窗口的数据泄露，我们不能随机打乱。
+        # 但由于我们是多只股票，按 "总索引" 切分可能把某只股票全部切进 Test。
+        # 更好的方法是：对每只股票，前 90% 时间做 Train，后 10% 做 Valid。
+        # 但为了实现简单且高效，我们采用全局时间切分：
+        # 直接按 valid_indices 的顺序切分（因为 valid_indices 是按 code 排序的，这其实是 GroupKFold 的一种变体）
+        # 等等，按 Code 排序切分意味着 Test 集是“全新的几只股票”，而不是“未来的时间”。这是 Cross-Sectional Split。
+        # 对于量化模型，我们更想要“未来的时间”做测试。
+
+        # 修正方案：基于日期进行切分
+        # 1. 找到分割日期 (Split Date)
+        dates = panel_df['date'].unique()
+        dates.sort()
+        split_idx = int(len(dates) * 0.9)
+        split_date = dates[split_idx]
+        print(f"训练/验证切分日期: {split_date}")
+
+        # 2. 重新构建索引，分为 Train/Valid
+        # 这需要我们在遍历 valid_indices 时知道对应的日期
+        # idx 是 feature_matrix 的索引，对应 panel_df 的行号
+
+        # 为了性能，我们直接操作 panel_df 的 date 列
+        # 获取所有样本对应的日期 (valid_indices 指向的是窗口的起点，但预测的是终点+预测期)
+        # 我们用窗口结束日作为基准
+        sample_dates = panel_df['date'].values[np.array(valid_indices) + seq_len - 1]
+
+        train_mask = sample_dates < split_date
+        train_indices = np.array(valid_indices)[train_mask]
+        valid_indices = np.array(valid_indices)[~train_mask]
+
+        print(f"训练集样本: {len(train_indices)} | 验证集样本: {len(valid_indices)}")
+
+        # 构造生成器
+        def gen_train():
+            # 训练集可以打乱
+            np.random.shuffle(train_indices)
+            for idx in train_indices:
+                yield {
+                    "past_values": feature_matrix[idx: idx + seq_len],
+                    "labels": target_array[idx + seq_len - 1]
+                }
+
+        def gen_valid():
+            # 验证集保持顺序
             for idx in valid_indices:
                 yield {
                     "past_values": feature_matrix[idx: idx + seq_len],
                     "labels": target_array[idx + seq_len - 1]
                 }
 
-        ds = Dataset.from_generator(gen)
-        ds = ds.train_test_split(test_size=0.1, shuffle=True)
+        train_ds = Dataset.from_generator(gen_train)
+        valid_ds = Dataset.from_generator(gen_valid)
+
+        # 手动组合成 DatasetDict
+        from datasets import DatasetDict
+        ds = DatasetDict({
+            'train': train_ds,
+            'test': valid_ds
+        })
 
         return ds, len(feature_cols)
 
 
-# 对外接口
 def get_dataset():
-    panel_df, feature_cols = DataProvider.load_and_process_panel()
+    panel_df, feature_cols = DataProvider.load_and_process_panel(mode='train')
     ds, num_features = DataProvider.make_dataset(panel_df, feature_cols)
     return ds, num_features
