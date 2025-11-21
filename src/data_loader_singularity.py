@@ -13,19 +13,18 @@ from datasets import Dataset
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 from .config import Config
-# 引入 VPN 控制器
 from .vpn_rotator import vpn_rotator
 
 
 class DataProvider:
-    # 线程锁
     _vpn_lock = threading.Lock()
     _last_switch_time = 0
 
     # ==============================================================================
-    #   Phase 1: 数据下载 (全量维护版)
-    #   策略: 每日全量覆盖 (Overwrite) 以修正前复权因子
+    #   配置区：数据粒度
+    #   可选值: 'daily' (日线), '1' (1分钟), '5' (5分钟), '15', '30', '60'
     # ==============================================================================
+    DATA_PERIOD = '5'  # <--- 修改这里来改变粒度
 
     @staticmethod
     def _setup_proxy_env():
@@ -40,7 +39,6 @@ class DataProvider:
 
     @classmethod
     def _safe_switch_vpn(cls):
-        """线程安全的 VPN 切换"""
         with cls._vpn_lock:
             if time.time() - cls._last_switch_time < 5:
                 return
@@ -51,35 +49,60 @@ class DataProvider:
     @staticmethod
     def _download_worker(code):
         """
-        下载单元
+        通用下载单元 (支持 日线/分钟线 自动切换)
         """
-        path = os.path.join(Config.DATA_DIR, f"{code}.parquet")
+        # 根据粒度区分文件名，避免覆盖
+        # 例如: 000001_daily.parquet 或 000001_5m.parquet
+        suffix = "daily" if DataProvider.DATA_PERIOD == 'daily' else f"{DataProvider.DATA_PERIOD}m"
+        path = os.path.join(Config.DATA_DIR, f"{code}_{suffix}.parquet")
 
         for attempt in range(5):
             try:
                 time.sleep(random.uniform(0.05, 0.2))
 
-                # 1. 网络请求
-                # 注意：Config.START_DATE 建议设置为 '20050101' 或更早，以获取全量历史
-                df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=Config.START_DATE, adjust="qfq")
+                df = None
+
+                # --- 分支 1: 下载日线数据 ---
+                if DataProvider.DATA_PERIOD == 'daily':
+                    df = ak.stock_zh_a_hist(
+                        symbol=code,
+                        period="daily",
+                        start_date=Config.START_DATE,
+                        adjust="qfq"
+                    )
+                    if df is not None and not df.empty:
+                        df.rename(columns={'日期': 'date', '开盘': 'open', '收盘': 'close',
+                                           '最高': 'high', '最低': 'low', '成交量': 'volume'}, inplace=True)
+
+                # --- 分支 2: 下载分钟级数据 ---
+                else:
+                    # 分钟线接口: period 可选 '1', '5', '15', '30', '60'
+                    df = ak.stock_zh_a_hist_min_em(
+                        symbol=code,
+                        start_date=f"{Config.START_DATE} 09:00:00",  # 格式兼容
+                        period=DataProvider.DATA_PERIOD,
+                        adjust="qfq"
+                    )
+                    if df is not None and not df.empty:
+                        # 分钟线列名通常是 '时间', '开盘', ...
+                        df.rename(columns={'时间': 'date', '开盘': 'open', '收盘': 'close',
+                                           '最高': 'high', '最低': 'low', '成交量': 'volume'}, inplace=True)
 
                 if df is None or df.empty:
                     return code, True, "Empty"
 
-                # 2. 格式清洗
-                df.rename(columns={'日期': 'date', '开盘': 'open', '收盘': 'close',
-                                   '最高': 'high', '最低': 'low', '成交量': 'volume'}, inplace=True)
+                # 统一处理索引
                 df['date'] = pd.to_datetime(df['date'])
                 df.set_index('date', inplace=True)
 
-                # 3. 全量覆盖写入 (Overwrite)
-                # 这样能确保每天的分红拆股调整都是最新的
+                # 存盘
                 if len(df) > 0:
                     df.to_parquet(path)
 
                 return code, True, "Success"
 
             except Exception as e:
+                # print(f"Err {code}: {e}")
                 DataProvider._safe_switch_vpn()
                 continue
 
@@ -87,11 +110,11 @@ class DataProvider:
 
     @staticmethod
     def download_data():
-        """下载入口 (支持每日更新 + 断点续传)"""
-        print(">>> [Phase 1] 初始化下载引擎 (全量维护模式)...")
+        """下载入口"""
+        print(f">>> [Phase 1] 初始化下载引擎 (粒度: {DataProvider.DATA_PERIOD})...")
         DataProvider._setup_proxy_env()
 
-        # 获取最新股票列表
+        # 获取股票列表
         codes = []
         for _ in range(5):
             try:
@@ -109,45 +132,29 @@ class DataProvider:
         if not os.path.exists(Config.DATA_DIR):
             os.makedirs(Config.DATA_DIR)
 
-        # ==========================================
-        # 核心升级：智能新鲜度检查 (Smart Freshness)
-        # ==========================================
-        print(">>> 正在检查本地数据新鲜度...")
+        # 智能断点续传 (根据当前粒度后缀过滤)
+        suffix = "daily" if DataProvider.DATA_PERIOD == 'daily' else f"{DataProvider.DATA_PERIOD}m"
+        print(f">>> 扫描本地已下载数据 (后缀: _{suffix}.parquet)...")
 
-        # 获取今天的日期字符串 (例如 '2023-10-27')
-        today_str = datetime.date.today().strftime("%Y-%m-%d")
-
-        existing_fresh_codes = set()
         files = os.listdir(Config.DATA_DIR)
-
-        for fname in files:
-            if fname.endswith(".parquet"):
-                fpath = os.path.join(Config.DATA_DIR, fname)
-                # 1. 检查文件是否有效
-                if os.path.getsize(fpath) > 1024:
-                    # 2. 【关键】检查文件最后修改时间
-                    mtime = os.path.getmtime(fpath)
-                    file_date = datetime.date.fromtimestamp(mtime).strftime("%Y-%m-%d")
-
-                    # 只有【今天】下载过的文件才算完成，不用再下
-                    # 昨天的文件虽然存在，但需要更新（重下），所以不加入 existing_fresh_codes
-                    if file_date == today_str:
-                        code = fname.replace(".parquet", "")
-                        existing_fresh_codes.add(code)
+        # 只检查当前粒度的文件
+        existing_codes = {
+            f.split('_')[0] for f in files
+            if f.endswith(f"_{suffix}.parquet") and os.path.getsize(os.path.join(Config.DATA_DIR, f)) > 1024
+        }
 
         all_codes_set = set(codes)
-        # 待办列表 = 所有股票 - 今天已下载的
-        todo_codes = list(all_codes_set - existing_fresh_codes)
+        todo_codes = list(all_codes_set - existing_codes)
         todo_codes.sort()
 
-        print(f"📊 任务统计: 总数 {len(codes)} | 今日已新 {len(existing_fresh_codes)} | 待更新 {len(todo_codes)}")
+        print(f"📊 任务统计: 总数 {len(codes)} | 已完成 {len(existing_codes)} | 待下载 {len(todo_codes)}")
 
         if not todo_codes:
-            print("✅ 今日全量数据已更新完毕！")
+            print("✅ 当前粒度数据已全部下载完毕。")
             return
 
-        MAX_WORKERS = 16
-        print(f"🚀 启动 {MAX_WORKERS} 线程并发更新...")
+        MAX_WORKERS = 8  # 分钟线数据量大，建议降低并发数防止内存溢出或封锁过快
+        print(f"🚀 启动 {MAX_WORKERS} 线程并发下载 (分钟线速度较慢请耐心等待)...")
 
         failed_codes = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -163,7 +170,7 @@ class DataProvider:
                 except:
                     failed_codes.append(code)
 
-        print(f"更新结束。失败数: {len(failed_codes)}")
+        print(f"下载结束。失败数: {len(failed_codes)}")
 
     # ==============================================================================
     #   Phase 2: 数据处理
@@ -172,6 +179,7 @@ class DataProvider:
     @staticmethod
     def process_single_stock(df):
         from .alpha_lib import AlphaFactory
+        # 分钟级预测通常预测未来 N 个 Bar，比如未来 12 个 5分钟(1小时)
         df['target'] = df['close'].shift(-Config.PRED_LEN) / df['close'] - 1
         factory = AlphaFactory(df)
         df = factory.make_factors()
@@ -181,9 +189,11 @@ class DataProvider:
         return df, factor_cols
 
     def generator(self):
-        files = glob.glob(os.path.join(Config.DATA_DIR, "*.parquet"))
-        # 全量训练模式：移除切片限制，读取所有文件
-        # 如果显存不足，Trainer 会自动处理 Batch
+        # 这里也要适配文件名
+        suffix = "daily" if DataProvider.DATA_PERIOD == 'daily' else f"{DataProvider.DATA_PERIOD}m"
+        pattern = f"*_{suffix}.parquet"
+
+        files = glob.glob(os.path.join(Config.DATA_DIR, pattern))
         target_files = files
 
         for fpath in target_files:
@@ -203,26 +213,3 @@ class DataProvider:
                     }
             except:
                 continue
-
-
-def get_dataset():
-    provider = DataProvider()
-    try:
-        pass
-    except:
-        pass
-
-    ds = Dataset.from_generator(provider.generator)
-    ds = ds.train_test_split(test_size=0.1)
-
-    # 动态探测 Feature 维度
-    temp_gen = provider.generator()
-    try:
-        first = next(temp_gen)
-        num_features = first['past_values'].shape[1]
-    except:
-        # 如果还没有数据，给一个默认值避免报错，提示用户去下载
-        print("⚠️ 警告：未检测到训练数据，请先运行 download")
-        num_features = 12
-
-    return ds, num_features
