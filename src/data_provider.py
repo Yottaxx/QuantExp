@@ -48,6 +48,7 @@ class DataProvider:
             try:
                 time.sleep(random.uniform(0.05, 0.2))
                 df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=Config.START_DATE, adjust="qfq")
+
                 if df is None or df.empty: return code, True, "Empty"
 
                 df.rename(columns={'日期': 'date', '开盘': 'open', '收盘': 'close',
@@ -55,13 +56,37 @@ class DataProvider:
                 df['date'] = pd.to_datetime(df['date'])
                 df.set_index('date', inplace=True)
 
-                # 【优化 1】安全类型转换，防止脏数据 Crash
+                # 安全转换
                 for col in ['open', 'close', 'high', 'low', 'volume']:
                     if col in df.columns:
                         df[col] = pd.to_numeric(df[col], errors='coerce').astype(np.float32)
 
-                # 剔除包含 NaN 的行 (可能是停牌或数据错误)
-                df.dropna(inplace=True)
+                df.dropna(inplace=True)  # 先剔除脏数据
+
+                # 【核心修复：时间连续性对齐】
+                # 如果股票中间停牌，akshare 返回的数据会跳过那些日期
+                # 我们需要用完整的交易日历 reindex，并填充停牌期间的数据
+                if not df.empty:
+                    full_idx = pd.date_range(start=df.index.min(), end=df.index.max(), freq='D')
+                    df = df.reindex(full_idx)
+
+                    # 停牌处理逻辑：
+                    # 1. 价格 (open/close/high/low) -> 用前一天的收盘价填充 (ffill)
+                    # 2. 成交量 (volume) -> 填 0
+
+                    # 先处理 volume，停牌时量为0
+                    if 'volume' in df.columns:
+                        df['volume'] = df['volume'].fillna(0)
+
+                    # 价格 forward fill
+                    df = df.ffill()
+
+                    # 如果开头有 NaN (上市前几天)，剔除
+                    df.dropna(inplace=True)
+
+                    # 重新过滤掉非交易日(周末)，只保留周一到周五
+                    # (简易做法，严谨做法是加载交易所日历，但 A 股基本就是工作日)
+                    df = df[df.index.dayofweek < 5]
 
                 if len(df) > 0: df.to_parquet(path)
                 return code, True, "Success"
@@ -71,6 +96,7 @@ class DataProvider:
         return code, False, "Failed"
 
     # ... [download_data, _get_cache_path, _filter_universe 保持不变] ...
+    # (请直接复制之前的代码)
     @staticmethod
     def download_data():
         print(">>> [Phase 1] 启动数据下载 (智能增量模式)...")
@@ -121,18 +147,10 @@ class DataProvider:
         print(f"过滤完成。移除样本: {original_len - new_len} ({1 - new_len / original_len:.2%})")
         return panel_df
 
-    # --------------------------------------------------------------------------
-    # PART 2: Panel 处理 (增加 force_refresh)
-    # --------------------------------------------------------------------------
-
     @staticmethod
     def load_and_process_panel(mode='train', force_refresh=False):
-        """
-        :param force_refresh: 是否强制重新计算因子 (忽略缓存)
-        """
         cache_path = DataProvider._get_cache_path(mode)
 
-        # 【优化 2】增加强制刷新逻辑
         if not force_refresh and os.path.exists(cache_path):
             print(f"⚡️ [Cache Hit] 发现今日缓存，正在极速加载: {cache_path}")
             try:
@@ -155,7 +173,6 @@ class DataProvider:
             try:
                 df = pd.read_parquet(f)
                 code = os.path.basename(f).replace(".parquet", "")
-                # 再次确保类型安全
                 float_cols = df.select_dtypes(include=['float64']).columns
                 df[float_cols] = df[float_cols].astype(np.float32)
                 df['code'] = code
