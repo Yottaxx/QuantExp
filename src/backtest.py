@@ -1,59 +1,38 @@
 import backtrader as bt
 import pandas as pd
-import os
-import math
 import numpy as np
+import os
 import akshare as ak
+import torch
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 from .config import Config
+from .model import PatchTSTForStock
+from .data_provider import DataProvider
 
-# 设置 Matplotlib 中文字体 (避免乱码)
+# 设置 Matplotlib 中文字体
 plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 
 # ==============================================================================
-#  1. A 股专用费率模型 (Commission Scheme)
+#  策略类：接收外部信号驱动 (Signal Driven Strategy)
 # ==============================================================================
-class AShareCommission(bt.CommInfoBase):
-    """
-    A股费率：佣金万三，印花税万五(卖出)，最低5元
-    """
+class ModelDrivenStrategy(bt.Strategy):
     params = (
-        ('stocklike', True),
-        ('commtype', bt.CommInfoBase.COMM_PERC),
-        ('perc', 0.0003),  # 佣金
-        ('stamp_duty', 0.0005),  # 印花税
-        ('min_comm', 5.0),  # 最低佣金
-    )
-
-    def _getcommission(self, size, price, pseudoexec):
-        if size > 0:  # 买入
-            commission = abs(size) * price * self.p.perc
-            return max(commission, self.p.min_comm)
-        elif size < 0:  # 卖出
-            commission = abs(size) * price * self.p.perc
-            commission = max(commission, self.p.min_comm)
-            stamp_duty = abs(size) * price * self.p.stamp_duty
-            return commission + stamp_duty
-        return 0.0
-
-
-# ==============================================================================
-#  2. 策略实现 (增加资金风控逻辑)
-# ==============================================================================
-class TopKStrategy(bt.Strategy):
-    params = (
+        ('signals', None),  # 外部传入的信号 DataFrame: index=date, columns=codes, value=rank/score
         ('top_k', 5),
         ('hold_days', 5),
-        ('min_volume_percent', 0.02),  # 风控：持仓不能超过该股票日成交量的 2%
     )
 
     def __init__(self):
-        self.hold_time = {}
+        self.hold_time = {}  # 记录持仓天数
+        self.rebalance_days = 0  # 记录调仓计数
 
     def next(self):
-        # --- 卖出逻辑 ---
+        current_date = self.data.datetime.date(0)
+
+        # 1. 检查卖出 (持有期满)
         for data in self.datas:
             pos = self.getposition(data).size
             if pos > 0:
@@ -63,306 +42,237 @@ class TopKStrategy(bt.Strategy):
                     self.close(data=data)
                     self.hold_time[name] = 0
 
-        # --- 智能买入逻辑 ---
+        # 2. 检查买入 (根据模型信号)
+        # 从 signals 中获取当天的目标股票
+        if self.p.signals is None: return
+
+        # 转换 current_date 为 pandas timestamp 以便索引
+        try:
+            ts = pd.Timestamp(current_date)
+            if ts not in self.p.signals.index:
+                return  # 当天无信号
+
+            # 获取当天的 Top K 代码
+            daily_ranks = self.p.signals.loc[ts]
+            # 假设 signals 存的是 score，我们取最大的 Top K
+            # daily_ranks 是一个 Series: index=code, value=score
+            top_targets = daily_ranks.nlargest(self.p.top_k).index.tolist()
+
+        except Exception as e:
+            # print(f"Signal lookup error: {e}")
+            return
+
+        # 执行买入
         cash = self.broker.get_cash()
-        # [风控 1] 资金太少，甚至不够付最低佣金，停止交易
         if cash < 5000: return
 
-        # 计算当前持仓数量
         current_positions = len([d for d in self.datas if self.getposition(d).size > 0])
+        slots = self.p.top_k - current_positions
+        if slots <= 0: return
 
-        # 还能买几只？
-        slots_available = self.p.top_k - current_positions
-        if slots_available <= 0: return
+        target_val = cash / slots * 0.98
 
-        # 每只股票分配资金 (预留 2% 现金防止滑点)
-        target_val = cash / slots_available * 0.98
-
-        buy_count = 0
-
-        # 假设 datas 已经按预测分排序传入
-        for data in self.datas:
-            if buy_count >= slots_available: break
+        for target_code in top_targets:
+            # 找到对应的 data feed
+            data = self.getdatabyname(target_code)
+            if data is None: continue  # 数据可能缺失
 
             pos = self.getposition(data).size
             if pos == 0:
                 price = data.close[0]
-                volume = data.volume[0]  # 单位通常是手
-
-                if price <= 0 or volume <= 0: continue
-
-                # 计算理论买入股数 (向下取整到 100 股)
+                if price <= 0: continue
                 size = int(target_val / price / 100) * 100
-
-                # [风控 2: 小资金保护]
-                # 如果连一手都买不起，跳过
-                if size < 100:
-                    continue
-
-                # [风控 3: 大资金保护 - 流动性上限]
-                # 防止资金量过大对盘面造成冲击
-                # volume * 100 是当日总成交股数
-                max_liquid_size = volume * 100 * self.p.min_volume_percent
-
-                if size > max_liquid_size:
-                    # 强制缩减仓位至流动性允许范围
-                    size = int(max_liquid_size / 100) * 100
-
                 if size >= 100:
                     self.buy(data=data, size=size)
-                    self.hold_time[data._name] = 0
-                    buy_count += 1
+                    self.hold_time[target_code] = 0
 
 
 # ==============================================================================
-#  3. 绩效分析引擎 (Metrics Engine)
+#  滚动预测引擎 (Walk-Forward Predictor)
 # ==============================================================================
-class PerformanceAnalyzer:
-    @staticmethod
-    def get_benchmark(start_date, end_date):
-        """获取沪深300基准数据"""
-        print(f"⏳ 正在获取沪深300基准数据 ({start_date} - {end_date})...")
-        try:
-            # 使用 AkShare 接口
-            df = ak.stock_zh_index_daily(symbol="sh000300")
-            df['date'] = pd.to_datetime(df['date'])
-            df.set_index('date', inplace=True)
+class WalkForwardEngine:
+    def __init__(self, start_date, end_date):
+        self.start_date = start_date
+        self.end_date = end_date
+        self.device = Config.DEVICE
+        self.model_path = f"{Config.OUTPUT_DIR}/final_model"
 
-            mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
-            bench_series = df.loc[mask, 'close']
+    def generate_signals(self):
+        """
+        生成全历史的模型预测信号
+        """
+        print(">>> [Walk-Forward] 正在生成历史预测信号...")
 
-            return bench_series.pct_change().fillna(0)
-        except Exception as e:
-            print(f"⚠️ 无法获取基准数据: {e}")
+        # 1. 加载模型
+        if not os.path.exists(self.model_path):
+            print("❌ 模型未找到")
             return None
+        model = PatchTSTForStock.from_pretrained(self.model_path).to(self.device)
+        model.eval()
 
-    @staticmethod
-    def calculate_metrics(strategy_returns, benchmark_returns):
-        """计算 Alpha, Beta, Sharpe, MaxDD 等核心指标"""
-        # 对齐日期索引
-        df = pd.concat([strategy_returns, benchmark_returns], axis=1, join='inner')
-        df.columns = ['Strategy', 'Benchmark']
+        # 2. 加载数据 (使用 predict 模式保留最新数据，且需要全量数据来构建窗口)
+        # 为了回测历史，我们需要覆盖 start_date 之前 Config.CONTEXT_LEN 的数据
+        panel_df, feature_cols = DataProvider.load_and_process_panel(mode='predict')
 
-        if len(df) < 10: return None
+        # 3. 滚动预测
+        # 这里的逻辑和 analysis.py 类似，但我们需要把结果整理成 Backtrader 可用的格式
+        # 即：DataFrame, Index=Date, Columns=Codes, Values=Score
 
-        R_p = df['Strategy']
-        R_m = df['Benchmark']
+        # 为了速度，我们还是使用 Batch 推理
+        # ... (复用 analysis.py 的推理逻辑) ...
+        # 这里为了代码简洁，直接调用 analysis 模块的逻辑，或者重写一遍
+        # 我们重写一遍简化的，只返回信号矩阵
 
-        # 1. 年化收益率
-        days = len(df)
-        total_ret_p = (1 + R_p).prod() - 1
-        ann_ret_p = (1 + total_ret_p) ** (252 / days) - 1
+        # 筛选时间：start_date 往前推 60 天用于窗口构建
+        s_date = pd.to_datetime(self.start_date) - pd.Timedelta(days=60)
+        e_date = pd.to_datetime(self.end_date)
+        mask = (panel_df['date'] >= s_date) & (panel_df['date'] <= e_date)
+        df_sub = panel_df[mask].copy()
 
-        total_ret_m = (1 + R_m).prod() - 1
-        ann_ret_m = (1 + total_ret_m) ** (252 / days) - 1
+        results = []
+        batch_inputs = []
+        batch_meta = []
 
-        # 2. 波动率
-        vol_p = R_p.std() * np.sqrt(252)
+        grouped = df_sub.groupby('code')
+        print("正在批量推理...")
 
-        # 3. 夏普比率
-        sharpe = (ann_ret_p - 0.03) / (vol_p + 1e-9)
+        for code, group in tqdm(grouped):
+            if len(group) < Config.CONTEXT_LEN: continue
+            feats = group[feature_cols].values.astype(np.float32)
+            dates = group['date'].values
 
-        # 4. 最大回撤
-        cum_returns = (1 + R_p).cumprod()
-        drawdown = (cum_returns.cummax() - cum_returns) / cum_returns.cummax()
-        max_dd = drawdown.max()
+            for i in range(len(group) - Config.CONTEXT_LEN + 1):
+                # 预测日期是窗口最后一天
+                pred_date = pd.to_datetime(dates[i + Config.CONTEXT_LEN - 1])
+                if pred_date < pd.to_datetime(self.start_date): continue
 
-        # 5. Beta & Alpha
-        cov_matrix = np.cov(R_p, R_m)
-        beta = cov_matrix[0, 1] / (cov_matrix[1, 1] + 1e-9)
-        alpha = ann_ret_p - (0.03 + beta * (ann_ret_m - 0.03))
+                batch_inputs.append(feats[i: i + Config.CONTEXT_LEN])
+                batch_meta.append((pred_date, code))
 
-        # 6. 信息比率
-        active_ret = R_p - R_m
-        ir = (active_ret.mean() * 252) / (active_ret.std() * np.sqrt(252) + 1e-9)
+                if len(batch_inputs) >= 2048:
+                    self._flush(model, batch_inputs, batch_meta, results)
+                    batch_inputs = []
+                    batch_meta = []
 
-        return {
-            "Ann. Return": ann_ret_p,
-            "Benchmark Ret": ann_ret_m,
-            "Alpha": alpha,
-            "Beta": beta,
-            "Sharpe": sharpe,
-            "Max Drawdown": max_dd,
-            "Info Ratio": ir,
-            "Win Rate": (R_p > 0).mean()
-        }
+        if batch_inputs:
+            self._flush(model, batch_inputs, batch_meta, results)
 
-    @staticmethod
-    def plot_curve(strategy_returns, benchmark_returns):
-        df = pd.concat([strategy_returns, benchmark_returns], axis=1, join='inner')
-        df.columns = ['Strategy', 'CSI 300']
-        equity = (1 + df).cumprod()
+        # 转换为信号矩阵 (Pivot Table)
+        print("正在构建信号矩阵...")
+        res_df = pd.DataFrame(results, columns=['date', 'code', 'score'])
+        # pivot: index=date, columns=code, values=score
+        signal_matrix = res_df.pivot(index='date', columns='code', values='score')
+        return signal_matrix
 
-        plt.figure(figsize=(12, 6))
-        plt.plot(equity.index, equity['Strategy'], label='Our Strategy', color='#d62728', linewidth=2)
-        plt.plot(equity.index, equity['CSI 300'], label='Benchmark (CSI300)', color='gray', linestyle='--', alpha=0.8)
-        plt.title('Strategy Equity Curve vs Benchmark')
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        save_path = os.path.join(Config.OUTPUT_DIR, "backtest_result.png")
-        plt.savefig(save_path)
-        print(f"📈 资金曲线图已保存至: {save_path}")
+    def _flush(self, model, inputs, meta, results):
+        tensor = torch.tensor(np.array(inputs), dtype=torch.float32).to(self.device)
+        with torch.no_grad():
+            scores = model(past_values=tensor).logits.squeeze().cpu().numpy()
+        if scores.ndim == 0: scores = [scores]
+        for i, s in enumerate(scores):
+            results.append((meta[i][0], meta[i][1], float(s)))
 
 
 # ==============================================================================
-#  回测执行核心 (支持 有费/无费 对比)
+#  回测主程序
 # ==============================================================================
-def run_single_backtest(codes, with_fees=True, initial_cash=1000000.0):
-    """
-    执行单次特定配置的回测
-    """
+def run_backtest(start_date='2024-01-01', end_date='2024-12-31', initial_cash=1000000.0):
+    print(f"\n>>> 启动模型驱动的 Walk-Forward 回测 ({start_date} ~ {end_date})")
+
+    # 1. 生成信号
+    engine = WalkForwardEngine(start_date, end_date)
+    signal_matrix = engine.generate_signals()
+
+    if signal_matrix is None or signal_matrix.empty:
+        print("❌ 未生成有效信号")
+        return
+
+    # 2. 初始化 Cerebro
     cerebro = bt.Cerebro()
-
-    # 1. 资金设置
     cerebro.broker.setcash(initial_cash)
 
-    # 2. 费率设置
-    if with_fees:
-        cerebro.broker.addcommissioninfo(AShareCommission())
-    else:
-        cerebro.broker.setcommission(commission=0.0)
+    # 费率
+    class AShareCommission(bt.CommInfoBase):
+        params = (('stocklike', True), ('commtype', bt.CommInfoBase.COMM_PERC),
+                  ('perc', 0.0003), ('stamp_duty', 0.0005), ('min_comm', 5.0))
 
-    # 3. 数据加载
-    data_loaded = False
-    for code in codes:
+        def _getcommission(self, size, price, pseudoexec):
+            if size > 0:
+                return max(abs(size) * price * self.p.perc, self.p.min_comm)
+            elif size < 0:
+                return max(abs(size) * price * self.p.perc, self.p.min_comm) + abs(size) * price * self.p.stamp_duty
+            return 0.0
+
+    cerebro.broker.addcommissioninfo(AShareCommission())
+
+    # 3. 加载数据 (只加载信号矩阵中涉及到的股票，且在时间范围内)
+    # 这里的 DataProvider 需要能快速加载指定股票的行情
+    # 为了简化，我们重新加载一遍 panel (或者您可以优化让 DataProvider 提供 get_price_data 接口)
+    print("正在加载回测行情数据...")
+
+    # 找出所有涉及到的股票代码
+    involved_codes = signal_matrix.columns.tolist()
+    # 为了演示，只取 Top 50 活跃的股票 (否则几千只加载进 Backtrader 会非常慢)
+    # 实际生产中可以使用数据库按需加载
+
+    # 简易方案：只加载 signal_matrix 中曾经进入过 Top 5 的股票
+    # 这是一种优化技巧：没被选中的股票不需要行情数据
+
+    top_k_mask = signal_matrix.rank(axis=1, ascending=False) <= 5
+    active_codes = signal_matrix.columns[top_k_mask.any()].tolist()
+    print(f"回测涉及活跃股票数: {len(active_codes)}")
+
+    loaded_count = 0
+    for code in tqdm(active_codes):
         fpath = os.path.join(Config.DATA_DIR, f"{code}.parquet")
         if not os.path.exists(fpath): continue
-
         try:
             df = pd.read_parquet(fpath)
-            start_date = pd.to_datetime(Config.START_DATE)
-            if len(df) > 250:
-                df = df.iloc[-250:]
-                start_date = df.index[0]
+            # 过滤时间
+            df = df[(df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))]
+            if df.empty: continue
 
-            data = bt.feeds.PandasData(
-                dataname=df,
-                fromdate=start_date,
-                plot=False
-            )
-            cerebro.adddata(data, name=code)
-            data_loaded = True
+            data = bt.feeds.PandasData(dataname=df, name=code, plot=False)
+            cerebro.adddata(data)
+            loaded_count += 1
         except:
             continue
 
-    if not data_loaded: return None
+    if loaded_count == 0:
+        print("❌ 无有效回测数据")
+        return
 
-    # 4. 策略与分析器
-    cerebro.addstrategy(TopKStrategy, top_k=5, hold_days=5)
-    # 添加交易分析器，用于计算胜率
-    cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
-    # 添加时间收益分析器，用于计算 Alpha/Beta
+    # 4. 注入策略
+    cerebro.addstrategy(ModelDrivenStrategy, signals=signal_matrix, top_k=5, hold_days=5)
+
+    # 5. 添加分析器
     cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='returns')
+    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', riskfreerate=0.02)
+    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
 
-    # 5. 运行
+    # 6. 运行
+    print("⏳ 开始回测 (这可能需要几分钟)...")
     results = cerebro.run()
     strat = results[0]
 
-    # 6. 提取指标
-    final_value = cerebro.broker.getvalue()
-    profit_rate = (final_value - initial_cash) / initial_cash
+    # 7. 报告
+    final_val = cerebro.broker.getvalue()
+    ret = (final_val - initial_cash) / initial_cash
+    sharpe = strat.analyzers.sharpe.get_analysis().get('sharperatio', 0)
+    max_dd = strat.analyzers.drawdown.get_analysis().get('max', {}).get('drawdown', 0)
 
-    # 提取胜率
-    trade_analysis = strat.analyzers.trade_analyzer.get_analysis()
-    total_trades = trade_analysis.total.closed if 'total' in trade_analysis else 0
-    won_trades = trade_analysis.won.total if 'won' in trade_analysis else 0
-    win_rate = (won_trades / total_trades) if total_trades > 0 else 0.0
+    print("\n" + "=" * 40)
+    print("📊 [Walk-Forward 回测报告]")
+    print(f"回测区间: {start_date} ~ {end_date}")
+    print(f"初始资金: {initial_cash:,.0f}")
+    print(f"最终资金: {final_val:,.2f}")
+    print(f"累计收益: {ret:.2%}")
+    print(f"夏普比率: {sharpe:.2f}")
+    print(f"最大回撤: {max_dd:.2%}")
+    print("=" * 40)
 
-    # 提取收益序列
-    ret_dict = strat.analyzers.returns.get_analysis()
-    strategy_ret = pd.Series(ret_dict, name='Strategy')
-    strategy_ret.index = pd.to_datetime(strategy_ret.index)
-
-    return {
-        "final_value": final_value,
-        "profit_rate": profit_rate,
-        "win_rate": win_rate,
-        "total_trades": total_trades,
-        "returns": strategy_ret,
-        "start_date": strat.data.datetime.date(0),  # 记录开始时间方便获取基准
-        "end_date": strat.data.datetime.date(-1)
-    }
-
-
-def run_backtest(top_stocks_list, initial_cash=50000.0):
-    """
-    主入口：执行两次回测并生成对比报告
-    """
-    print("\n" + "=" * 50)
-    print(f">>> 启动 SOTA 策略回测分析 (初始资金: {initial_cash:,.0f})")
-    print("=" * 50)
-
-    # 提取股票代码 (取 Top 5 进行演示)
-    target_codes = [x[0] for x in top_stocks_list[:5]]
-
-    if not target_codes:
-        print("❌ 没有可用的股票列表")
-        return
-
-    # 1. 运行含手续费回测 (真实模拟)
-    print("⏳ 正在进行 [真实环境] 回测 (含印花税/佣金)...")
-    res_fees = run_single_backtest(target_codes, with_fees=True, initial_cash=initial_cash)
-
-    # 2. 运行无手续费回测 (理论上限)
-    print("⏳ 正在进行 [理论环境] 回测 (无摩擦成本)...")
-    res_no_fees = run_single_backtest(target_codes, with_fees=False, initial_cash=initial_cash)
-
-    if not res_fees or not res_no_fees:
-        print("❌ 回测失败：无法加载数据")
-        return
-
-    # 3. 生成对比报表
-    print("\n" + "=" * 50)
-    print(f"{'指标 (Metric)':<15} | {'含手续费 (Real)':<15} | {'无手续费 (Ideal)':<15}")
-    print("-" * 50)
-
-    # 市值对比
-    print(f"{'最终市值':<15} | {res_fees['final_value']:<15,.2f} | {res_no_fees['final_value']:<15,.2f}")
-
-    # 收益率对比
-    p_real = res_fees['profit_rate']
-    p_ideal = res_no_fees['profit_rate']
-    print(f"{'累计收益率':<15} | {p_real:<15.2%} | {p_ideal:<15.2%}")
-
-    # 胜率对比
-    w_real = res_fees['win_rate']
-    w_ideal = res_no_fees['win_rate']
-    print(f"{'交易胜率':<15} | {w_real:<15.2%} | {w_ideal:<15.2%}")
-
-    # 交易次数
-    print(f"{'交易总次数':<15} | {res_fees['total_trades']:<15} | {res_no_fees['total_trades']:<15}")
-
-    print("=" * 50)
-
-    # 简评
-    cost_impact = p_ideal - p_real
-    print(f"💡 费率损耗分析: 交易摩擦成本共吞噬了 {cost_impact:.2%} 的利润。")
-    if w_real < 0.5:
-        print("⚠️ 警告: 真实胜率不足 50%，策略在费率压力下可能失效。")
-    elif cost_impact > 0.1:
-        print("⚠️ 警告: 费率损耗过高，建议降低换仓频率 (增加 hold_days)。")
-    else:
-        print("✅ 评价: 策略对交易成本不敏感，鲁棒性较好。")
-
-    # --- 4. 绩效归因与绘图 (仅基于真实含费结果) ---
-    # 获取基准数据
-    bench_ret = PerformanceAnalyzer.get_benchmark(res_fees['start_date'], res_fees['end_date'])
-
-    if bench_ret is not None:
-        metrics = PerformanceAnalyzer.calculate_metrics(res_fees['returns'], bench_ret)
-        if metrics:
-            print("\n" + "-" * 40)
-            print(f"📊 【基金经理级绩效报告 (基于真实净值)】")
-            print("-" * 40)
-            print(f"{'年化收益率':<15} : {metrics['Ann. Return']:>8.2%}")
-            print(f"{'基准收益率':<15} : {metrics['Benchmark Ret']:>8.2%}")
-            # 【核心新增】超额收益率展示
-            print(f"{'超额收益 (Excess)':<15} : {metrics['Ann. Return'] - metrics['Benchmark Ret']:>8.2%}")
-            print(f"{'Alpha (阿尔法)':<15} : {metrics['Alpha']:>8.4f}")
-            print(f"{'Beta (贝塔)':<15} : {metrics['Beta']:>8.4f}")
-            print(f"{'Sharpe (夏普)':<15} : {metrics['Sharpe']:>8.4f}")
-            print(f"{'最大回撤':<15} : {metrics['Max Drawdown']:>8.2%}")
-            print("=" * 60)
-
-            # 绘图
-            PerformanceAnalyzer.plot_curve(res_fees['returns'], bench_ret)
+    # 绘图
+    returns = pd.Series(strat.analyzers.returns.get_analysis())
+    (1 + returns).cumprod().plot(title="Strategy Equity Curve", figsize=(10, 6))
+    plt.savefig(os.path.join(Config.OUTPUT_DIR, "walk_forward_result.png"))
+    print("📈 曲线图已保存。")

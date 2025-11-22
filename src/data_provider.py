@@ -1,4 +1,3 @@
-# ... [前面 import 保持不变] ...
 import akshare as ak
 import pandas as pd
 import os
@@ -23,16 +22,11 @@ class DataProvider:
     _vpn_lock = threading.Lock()
     _last_switch_time = 0
 
-    # ... [PART 1: 下载模块 _setup_proxy_env 到 download_data 保持不变] ...
     @staticmethod
     def _setup_proxy_env():
         proxy_url = "http://127.0.0.1:7890"
-        os.environ['http_proxy'] = proxy_url
-        os.environ['https_proxy'] = proxy_url
-        os.environ['all_proxy'] = proxy_url
-        os.environ['HTTP_PROXY'] = proxy_url
-        os.environ['HTTPS_PROXY'] = proxy_url
-        os.environ['ALL_PROXY'] = proxy_url
+        for k in ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']:
+            os.environ[k] = proxy_url
 
     @classmethod
     def _safe_switch_vpn(cls):
@@ -96,6 +90,7 @@ class DataProvider:
                     if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').astype(np.float32)
                 df.dropna(inplace=True)
                 if not df.empty:
+                    # 交易日历对齐修复
                     full_idx = pd.date_range(start=df.index.min(), end=df.index.max(), freq='D')
                     df = df.reindex(full_idx)
                     if 'volume' in df.columns: df['volume'] = df['volume'].fillna(0)
@@ -163,9 +158,6 @@ class DataProvider:
         print(f"过滤完成。移除样本: {original_len - new_len} ({1 - new_len / original_len:.2%})")
         return panel_df
 
-    # --------------------------------------------------------------------------
-    # PART 3: Panel 加载与融合 (实盘目标函数修正版)
-    # --------------------------------------------------------------------------
     @staticmethod
     def load_and_process_panel(mode='train', force_refresh=False):
         cache_path = DataProvider._get_cache_path(mode)
@@ -178,9 +170,6 @@ class DataProvider:
                 pass
 
         print(f"\n>>> [Phase 2] 构建全内存 Panel 数据 (Mode: {mode})...")
-
-        # 1. 读取行情
-        print("正在加载行情数据...")
         price_files = glob.glob(os.path.join(Config.DATA_DIR, "*.parquet"))
         fund_dir = os.path.join(Config.DATA_DIR, "fundamental")
 
@@ -197,15 +186,12 @@ class DataProvider:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             results = list(tqdm(executor.map(_read_price, price_files), total=len(price_files), desc="Reading Price"))
-
         data_frames = [df for df in results if df is not None and len(df) > Config.CONTEXT_LEN]
         if not data_frames: raise ValueError("有效数据为空")
-
         panel_df = pd.concat(data_frames, ignore_index=False)
         del data_frames
         panel_df['code'] = panel_df['code'].astype(str)
 
-        # 2. 财务数据融合
         print("正在加载并合并财务数据...")
         fund_files = glob.glob(os.path.join(fund_dir, "*.parquet"))
 
@@ -220,7 +206,6 @@ class DataProvider:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             fund_frames = [df for df in executor.map(_read_fund, fund_files) if df is not None]
-
         if fund_frames:
             fund_df = pd.concat(fund_frames)
             fund_df = fund_df.reset_index().sort_values(['code', 'date'])
@@ -235,32 +220,13 @@ class DataProvider:
         if 'date' in panel_df.columns: panel_df = panel_df.set_index('date')
         panel_df = panel_df.reset_index().sort_values(['code', 'date'])
 
-        # 3. 计算时序因子
         print("计算时序因子...")
         panel_df = panel_df.groupby('code', group_keys=False).apply(lambda x: AlphaFactory(x).make_factors())
 
-        # ----------------------------------------------------------------------
-        # 【核心修正】构造实盘预测目标 (Execution-Adjusted Target)
-        # 旧逻辑: Close(T+k) / Close(T) - 1 (理论收益)
-        # 新逻辑: Close(T+k) / Open(T+1) - 1 (实盘次日开盘买入收益)
-        # ----------------------------------------------------------------------
-        print("正在构造预测目标 (Next Open Strategy)...")
-
-        # 获取 T+1 的开盘价 (Next Open)
+        print("构造实盘预测目标 (Execution-Adjusted Target)...")
         panel_df['next_open'] = panel_df.groupby('code')['open'].shift(-1)
-
-        # 获取 T+k 的收盘价 (Future Close)
-        # 注意：这里假设持有 PRED_LEN 天。如果 PRED_LEN=5，即 T+1 买入，T+6 收盘卖出？
-        # 通常我们定义预测周期为从 T+1 开始持有 N 天。
-        # 这里的 shift(-Config.PRED_LEN) 实际上取的是 T + PRED_LEN 日的数据。
-        # 收益 = (T + PRED_LEN 收盘价) / (T + 1 开盘价) - 1
         panel_df['future_close'] = panel_df.groupby('code')['close'].shift(-Config.PRED_LEN)
-
-        # 计算实盘收益率 Target
-        # 注意：如果是最后一两行，next_open 或 future_close 可能是 NaN，结果也是 NaN
         panel_df['target'] = panel_df['future_close'] / panel_df['next_open'] - 1
-
-        # 清理临时列
         panel_df.drop(columns=['next_open', 'future_close'], inplace=True)
 
         if mode == 'train':
@@ -290,7 +256,6 @@ class DataProvider:
 
         return panel_df, feature_cols
 
-    # ... [make_dataset 保持不变] ...
     @staticmethod
     def make_dataset(panel_df, feature_cols):
         print(">>> [Phase 3] 转换 Dataset...")
