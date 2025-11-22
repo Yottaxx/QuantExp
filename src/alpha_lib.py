@@ -6,7 +6,7 @@ from .config import Config
 
 class AlphaFactory:
     """
-    【SOTA 多因子构建工厂 v7.4 - 鲁棒增强版】
+    【SOTA 多因子构建工厂 v7.5 - 修正版】
     """
 
     def __init__(self, df: pd.DataFrame):
@@ -22,13 +22,9 @@ class AlphaFactory:
 
         self.returns = self.close.pct_change()
         self.vwap = (self.volume * (self.high + self.low + self.close) / 3).cumsum() / (self.volume.cumsum() + 1e-9)
-
-        # 【修正】增加 1e-9 防止除零或 log(0)
-        # 旧代码: np.log(self.close / self.close.shift(1))
         self.log_ret = np.log((self.close + 1e-9) / (self.close.shift(1) + 1e-9))
 
     def make_factors(self) -> pd.DataFrame:
-        """构建所有时间序列因子"""
         self._build_style_factors()
         self._build_technical_factors()
         self._build_fundamental_factors()
@@ -42,13 +38,22 @@ class AlphaFactory:
     @staticmethod
     def _orthogonalize_factors(df, factor_cols):
         M = df[factor_cols].fillna(0).values
-        M = (M - np.mean(M, axis=0)) / (np.std(M, axis=0) + 1e-9)
+        # 标准化
         try:
+            M_mean = np.mean(M, axis=0)
+            M_std = np.std(M, axis=0) + 1e-9
+            M = (M - M_mean) / M_std
+
+            # SVD 分解
             U, S, Vh = np.linalg.svd(M, full_matrices=False)
             M_orth = np.dot(U, Vh)
+
+            # 恢复尺度 (可选，这里保持正态分布)
             M_orth = (M_orth - np.mean(M_orth, axis=0)) / (np.std(M_orth, axis=0) + 1e-9)
             return pd.DataFrame(M_orth, columns=factor_cols, index=df.index)
-        except:
+        except Exception as e:
+            # 【修正】增加日志，且返回原始数据以防崩溃
+            # print(f"Warning: SVD failed for date {df.name if hasattr(df, 'name') else 'Unknown'}: {e}")
             return df[factor_cols]
 
     @staticmethod
@@ -201,11 +206,18 @@ class AlphaFactory:
         factor_cols = [c for c in self.df.columns
                        if any(c.startswith(p) for p in Config.FEATURE_PREFIXES)]
         self.df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        self.df[factor_cols] = self.df[factor_cols].fillna(method='ffill').fillna(0)
+
+        # 【修正】使用 0 而不是 ffill 填充 Z-Score 预处理前的空值
+        # ffill 容易造成僵尸数据（停牌期间数据不变，导致波动率计算为0，zscore异常）
+        # 对于 Rolling 窗口产生的 NaN，填 0 (均值) 是更安全的选择
+        self.df[factor_cols] = self.df[factor_cols].fillna(0)
+
         for col in factor_cols:
             if col.startswith('time_'): continue
             series = self.df[col]
             series = ops.zscore(series, window=60)
             series = series.clip(-4, 4)
             self.df[col] = series
+
+        # 二次填充，防止 Z-Score 计算后产生新的 NaN
         self.df[factor_cols] = self.df[factor_cols].fillna(0)

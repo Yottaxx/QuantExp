@@ -317,8 +317,19 @@ class DataProvider:
         print(">>> [Phase 3] 转换 Dataset...")
         panel_df = panel_df.sort_values(['code', 'date'])
         feature_matrix = panel_df[feature_cols].values.astype(np.float32)
-        target_col = 'rank_label' if 'rank_label' in panel_df.columns else 'target'
-        target_array = panel_df[target_col].fillna(0.5).values.astype(np.float32)
+
+        # 【差异修正】动态判断填充值，防止数值污染
+        if 'rank_label' in panel_df.columns:
+            target_col = 'rank_label'
+            fill_val = 0.5
+        elif 'excess_label' in panel_df.columns:
+            target_col = 'excess_label'
+            fill_val = 0.0
+        else:
+            target_col = 'target'
+            fill_val = 0.0
+
+        target_array = panel_df[target_col].fillna(fill_val).values.astype(np.float32)
 
         codes = panel_df['code'].values
         code_changes = np.where(codes[:-1] != codes[1:])[0] + 1
