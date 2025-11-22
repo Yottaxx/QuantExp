@@ -15,6 +15,8 @@ class Config:
 
     # --- 数据参数 ---
     START_DATE = "20050101"
+    # 交易日历缓存，避免重复请求交易日
+    CALENDAR_CACHE = "./output/trading_calendar.parquet"
 
     # --- 网络与代理配置 (新增) ---
     # 本地代理地址 (供 requests/akshare 使用)
@@ -55,6 +57,8 @@ class Config:
 
     # --- 交易风控参数 ---
     MIN_VOLUME_PERCENT = 0.02  # 流动性风控
+    SLIPPAGE_BPS = 10  # 交易滑点（基点）
+    DAILY_LIMIT = 0.1  # 涨跌停限制（ST 可调整为 0.05）
     RISK_FREE_RATE = 0.02  # 无风险利率 (用于夏普比率计算)
 
     # --- 硬件 ---

@@ -16,11 +16,13 @@ from tqdm import tqdm
 from .config import Config
 from .vpn_rotator import vpn_rotator
 from .alpha_lib import AlphaFactory
+from .calendar_utils import TradingCalendar
 
 
 class DataProvider:
     _vpn_lock = threading.Lock()
     _last_switch_time = 0
+    _calendar = TradingCalendar(Config.START_DATE)
 
     # ... [PART 1: 下载模块保持不变，省略以节省篇幅] ...
     # 请保留原有的 _setup_proxy_env, _safe_switch_vpn, _get_latest_trading_date
@@ -48,6 +50,11 @@ class DataProvider:
             return pd.to_datetime(df['date']).max().date().strftime("%Y-%m-%d")
         except:
             return datetime.date.today().strftime("%Y-%m-%d")
+
+    @classmethod
+    def _align_to_calendar(cls, df: pd.DataFrame) -> pd.DataFrame:
+        """对齐至统一交易日历并标记停牌/涨跌停价格区间"""
+        return cls._calendar.align_frame(df)
 
     @staticmethod
     def _download_finance_worker(code):
@@ -94,12 +101,7 @@ class DataProvider:
                     if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').astype(np.float32)
                 df.dropna(inplace=True)
                 if not df.empty:
-                    full_idx = pd.date_range(start=df.index.min(), end=df.index.max(), freq='D')
-                    df = df.reindex(full_idx)
-                    if 'volume' in df.columns: df['volume'] = df['volume'].fillna(0)
-                    df = df.ffill()
-                    df.dropna(inplace=True)
-                    df = df[df.index.dayofweek < 5]
+                    df = DataProvider._align_to_calendar(df)
                 if len(df) > 0: df.to_parquet(path)
                 return code, True, "Success"
             except:
@@ -153,11 +155,17 @@ class DataProvider:
     def _filter_universe(panel_df):
         print(">>> [Filtering] 正在执行动态股票池过滤...")
         original_len = len(panel_df)
+        panel_df = panel_df[~panel_df.get('suspend', False)]
         panel_df = panel_df[panel_df['volume'] > 0]
         panel_df = panel_df[panel_df['close'] >= 2.0]
         panel_df['list_days'] = panel_df.groupby('code').cumcount()
         panel_df = panel_df[panel_df['list_days'] > 60]
         panel_df = panel_df.drop(columns=['list_days'])
+
+        # 剔除极端低流动性标的：成交量需高于20日均值的10%
+        panel_df['vol_ma20'] = panel_df.groupby('code')['volume'].transform(lambda x: x.rolling(20, min_periods=1).mean())
+        panel_df = panel_df[panel_df['volume'] >= panel_df['vol_ma20'] * 0.1]
+        panel_df = panel_df.drop(columns=['vol_ma20'])
         new_len = len(panel_df)
         print(f"过滤完成。移除样本: {original_len - new_len} ({1 - new_len / original_len:.2%})")
         return panel_df
@@ -190,6 +198,7 @@ class DataProvider:
                 float_cols = df.select_dtypes(include=['float64']).columns
                 df[float_cols] = df[float_cols].astype(np.float32)
                 df['code'] = code
+                df = DataProvider._align_to_calendar(df)
                 return df
             except:
                 return None
@@ -243,6 +252,10 @@ class DataProvider:
 
         if mode == 'train':
             panel_df.dropna(subset=['target'], inplace=True)
+
+        # 仅保留真实交易日样本，避免因日历填充带来的未来函数风险
+        if 'is_trading' in panel_df.columns:
+            panel_df = panel_df[panel_df['is_trading']]
 
         panel_df = DataProvider._filter_universe(panel_df)
 

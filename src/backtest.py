@@ -14,6 +14,22 @@ plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 
+class ExtendedPandasData(bt.feeds.PandasData):
+    lines = ('limit_up', 'limit_down', 'is_trading')
+    params = (
+        ('datetime', None),
+        ('open', 'open'),
+        ('high', 'high'),
+        ('low', 'low'),
+        ('close', 'close'),
+        ('volume', 'volume'),
+        ('openinterest', -1),
+        ('limit_up', 'limit_up'),
+        ('limit_down', 'limit_down'),
+        ('is_trading', 'is_trading'),
+    )
+
+
 # ==============================================================================
 #  1. 费率模型
 # ==============================================================================
@@ -137,6 +153,21 @@ class ModelDrivenStrategy(bt.Strategy):
                     top_codes = valid_row.nlargest(self.p.top_k).index.tolist()
                     self.signal_dict[date.date()] = top_codes
 
+    def _can_trade(self, data):
+        # 停牌或无量直接跳过
+        if hasattr(data, 'is_trading') and (not bool(data.is_trading[0])):
+            return False
+        price = data.close[0]
+        if price <= 0 or data.volume[0] <= 0:
+            return False
+        # 涨跌停限制
+        if hasattr(data, 'limit_up') and hasattr(data, 'limit_down'):
+            if price >= data.limit_up[0] * 0.999:
+                return False
+            if price <= data.limit_down[0] * 1.001:
+                return False
+        return True
+
     def next(self):
         current_date = self.data.datetime.date(0)
 
@@ -168,10 +199,9 @@ class ModelDrivenStrategy(bt.Strategy):
             data = self.getdatabyname(code)
             if data is None: continue
 
-            if self.getposition(data).size == 0:
+            if self.getposition(data).size == 0 and self._can_trade(data):
                 price = data.close[0]
                 vol = data.volume[0]
-                if price <= 0 or vol <= 0: continue
 
                 size = int(target_val / price / 100) * 100
 
@@ -181,7 +211,7 @@ class ModelDrivenStrategy(bt.Strategy):
                 if size > limit_size: size = limit_size
 
                 if size >= 100:
-                    self.buy(data=data, size=size)
+                    self.buy(data=data, size=size, price=price * (1 + Config.SLIPPAGE_BPS / 10000))
                     self.hold_time[code] = 0
                     buy_cnt += 1
 
@@ -277,6 +307,7 @@ class WalkForwardBacktester:
         cerebro = bt.Cerebro()
         cerebro.broker.setcash(self.initial_cash)
         cerebro.broker.addcommissioninfo(AShareCommission())
+        cerebro.broker.set_slippage_perc(Config.SLIPPAGE_BPS / 10000)
 
         print("正在加载回测行情数据...")
         loaded_cnt = 0
@@ -285,9 +316,15 @@ class WalkForwardBacktester:
             if not os.path.exists(fpath): continue
             try:
                 df = pd.read_parquet(fpath)
+                if 'limit_up' not in df.columns or 'limit_down' not in df.columns:
+                    df['prev_close'] = df['close'].shift(1)
+                    df['limit_up'] = df['prev_close'] * (1 + Config.DAILY_LIMIT)
+                    df['limit_down'] = df['prev_close'] * (1 - Config.DAILY_LIMIT)
+                if 'is_trading' not in df.columns:
+                    df['is_trading'] = df['volume'] > 0
                 df = df[(df.index >= pd.to_datetime(self.start_date)) & (df.index <= pd.to_datetime(self.end_date))]
                 if df.empty: continue
-                data = bt.feeds.PandasData(dataname=df, name=code, plot=False)
+                data = ExtendedPandasData(dataname=df, name=code, plot=False)
                 cerebro.adddata(data)
                 loaded_cnt += 1
             except:
@@ -354,6 +391,19 @@ class TopKStrategy(bt.Strategy):
     def __init__(self):
         self.hold_time = {}
 
+    def _can_trade(self, data):
+        if hasattr(data, 'is_trading') and (not bool(data.is_trading[0])):
+            return False
+        price = data.close[0]
+        if price <= 0 or data.volume[0] <= 0:
+            return False
+        if hasattr(data, 'limit_up') and hasattr(data, 'limit_down'):
+            if price >= data.limit_up[0] * 0.999:
+                return False
+            if price <= data.limit_down[0] * 1.001:
+                return False
+        return True
+
     def next(self):
         for data in self.datas:
             if self.getposition(data).size > 0:
@@ -370,15 +420,17 @@ class TopKStrategy(bt.Strategy):
         buy_cnt = 0
         for data in self.datas:
             if buy_cnt >= slots: break
-            if self.getposition(data).size == 0:
-                price = data.close[0];
+            if self.getposition(data).size == 0 and self._can_trade(data):
+                price = data.close[0]
                 vol = data.volume[0]
-                if price <= 0 or vol <= 0: continue
                 size = int(target / price / 100) * 100
                 if size < 100: continue
                 limit_size = int(vol * 100 * self.p.min_volume_percent / 100) * 100
                 if size > limit_size: size = limit_size
-                if size >= 100: self.buy(data=data, size=size); self.hold_time[data._name] = 0; buy_cnt += 1
+                if size >= 100:
+                    self.buy(data=data, size=size, price=price * (1 + Config.SLIPPAGE_BPS / 10000))
+                    self.hold_time[data._name] = 0
+                    buy_cnt += 1
 
 
 def run_single_backtest(codes, with_fees=True, initial_cash=1000000.0, top_k=5):
@@ -388,15 +440,22 @@ def run_single_backtest(codes, with_fees=True, initial_cash=1000000.0, top_k=5):
         cerebro.broker.addcommissioninfo(AShareCommission())
     else:
         cerebro.broker.setcommission(commission=0.0)
+    cerebro.broker.set_slippage_perc(Config.SLIPPAGE_BPS / 10000)
     loaded = False
     for code in codes:
         fpath = os.path.join(Config.DATA_DIR, f"{code}.parquet")
         if not os.path.exists(fpath): continue
         try:
             df = pd.read_parquet(fpath);
+            if 'limit_up' not in df.columns or 'limit_down' not in df.columns:
+                df['prev_close'] = df['close'].shift(1)
+                df['limit_up'] = df['prev_close'] * (1 + Config.DAILY_LIMIT)
+                df['limit_down'] = df['prev_close'] * (1 - Config.DAILY_LIMIT)
+            if 'is_trading' not in df.columns:
+                df['is_trading'] = df['volume'] > 0
             start = pd.to_datetime(Config.START_DATE)
             if len(df) > 250: df = df.iloc[-250:]
-            data = bt.feeds.PandasData(dataname=df, fromdate=df.index[0], plot=False)
+            data = ExtendedPandasData(dataname=df, fromdate=df.index[0], plot=False)
             cerebro.adddata(data, name=code);
             loaded = True
         except:
