@@ -1,14 +1,12 @@
 import pandas as pd
 import numpy as np
 from . import factor_ops as ops
+from .config import Config
 
 
 class AlphaFactory:
     """
-    【SOTA 多因子构建工厂 v7.2 - 索引安全版】
-
-    v7.2 核心修复：
-    修复了 add_cross_sectional_factors 中因索引不唯一导致的正交化(Orthogonalization)数据错乱 Bug。
+    【SOTA 多因子构建工厂 v7.3】
     """
 
     def __init__(self, df: pd.DataFrame):
@@ -27,7 +25,6 @@ class AlphaFactory:
         self.log_ret = np.log(self.close / self.close.shift(1))
 
     def make_factors(self) -> pd.DataFrame:
-        """构建所有时间序列因子"""
         self._build_style_factors()
         self._build_technical_factors()
         self._build_fundamental_factors()
@@ -40,31 +37,20 @@ class AlphaFactory:
 
     @staticmethod
     def _orthogonalize_factors(df, factor_cols):
-        """对称正交化核心逻辑"""
         M = df[factor_cols].fillna(0).values
-        # 标准化
         M = (M - np.mean(M, axis=0)) / (np.std(M, axis=0) + 1e-9)
         try:
             U, S, Vh = np.linalg.svd(M, full_matrices=False)
             M_orth = np.dot(U, Vh)
-            # 再次标准化保持尺度一致
             M_orth = (M_orth - np.mean(M_orth, axis=0)) / (np.std(M_orth, axis=0) + 1e-9)
-            # 保持索引一致以便回填
             return pd.DataFrame(M_orth, columns=factor_cols, index=df.index)
         except:
             return df[factor_cols]
 
     @staticmethod
     def add_cross_sectional_factors(panel_df: pd.DataFrame) -> pd.DataFrame:
-        """截面增强：排名 + 市场交互 + 【正交化】"""
-
-        # 【核心修复】: 必须重置索引，确保每一行都有唯一的 RangeIndex
-        # 否则下面的 groupby apply update 会因为 date 索引重复而导致数据错位
         if 'date' not in panel_df.columns:
             panel_df = panel_df.reset_index()
-
-        # 确保 date 存在且是 datetime
-        # 此时 panel_df.index 是唯一的 RangeIndex
 
         def apply_cs_clean_and_rank(x):
             x = ops.winsorize(x, method='mad')
@@ -81,12 +67,10 @@ class AlphaFactory:
 
         valid_cols = [c for c in target_cols if c in panel_df.columns]
 
-        # 1. 计算截面排名
         for col in valid_cols:
             new_col = f"cs_rank_{col}"
             panel_df[new_col] = panel_df.groupby('date')[col].transform(apply_cs_clean_and_rank)
 
-        # 2. 市场交互特征
         mkt_features = ['style_mom_1m', 'style_vol_1m', 'style_liquidity', 'alpha_006']
         mkt_valid = [c for c in mkt_features if c in panel_df.columns]
 
@@ -95,24 +79,15 @@ class AlphaFactory:
             panel_df[mkt_col_name] = panel_df.groupby('date')[col].transform('mean')
             panel_df[f"rel_{col}"] = panel_df[col] - panel_df[mkt_col_name]
 
-        # 3. 因子正交化 (修复版)
         print(">>> [AlphaFactory] 正在进行风格因子正交化 (SVD)...")
         style_cols = [c for c in panel_df.columns if c.startswith('style_')]
-
         if style_cols:
-            # 这里的 apply 会返回一个新的 DataFrame，索引是原始 RangeIndex (因为 group_keys=False 或默认保留原索引结构)
-            # 但为了万无一失，我们显式处理
             def apply_orth_wrapper(g):
                 return AlphaFactory._orthogonalize_factors(g, style_cols)
 
-            # 使用 group_keys=False 避免 Index 变成 MultiIndex (date, original_index)
-            # 这样返回的 orth_results 索引就是原始 RangeIndex，可以直接 update
             orth_results = panel_df.groupby('date', group_keys=False)[style_cols].apply(apply_orth_wrapper)
-
-            # 安全更新
             panel_df.update(orth_results)
 
-        # 4. 构造 Label
         if 'target' in panel_df.columns:
             panel_df['rank_label'] = panel_df.groupby('date')['target'].transform(lambda x: x.rank(pct=True))
             market_ret = panel_df.groupby('date')['target'].transform('mean')
@@ -120,7 +95,7 @@ class AlphaFactory:
 
         return panel_df
 
-    # ... [其余 build 函数保持不变，为节省篇幅省略] ...
+    # ... (Build functions omitted for brevity, same as before) ...
     def _build_style_factors(self):
         self.df['style_mom_1m'] = ops.ts_sum(self.log_ret, 20)
         self.df['style_mom_3m'] = ops.ts_sum(self.log_ret, 60)
@@ -219,14 +194,18 @@ class AlphaFactory:
         self.df['time_moy'] = (dates.month - 6.5) / 5.5
 
     def _preprocess_factors(self):
+        # 使用 Config 中的统一前缀列表
         factor_cols = [c for c in self.df.columns
-                       if any(c.startswith(p) for p in ['style_', 'tech_', 'alpha_', 'adv_', 'ind_', 'fund_', 'time_'])]
+                       if any(c.startswith(p) for p in Config.FEATURE_PREFIXES)]
+
         self.df.replace([np.inf, -np.inf], np.nan, inplace=True)
         self.df[factor_cols] = self.df[factor_cols].fillna(method='ffill').fillna(0)
+
         for col in factor_cols:
             if col.startswith('time_'): continue
             series = self.df[col]
             series = ops.zscore(series, window=60)
             series = series.clip(-4, 4)
             self.df[col] = series
+
         self.df[factor_cols] = self.df[factor_cols].fillna(0)

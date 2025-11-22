@@ -28,7 +28,7 @@ def check_market_regime(panel_df, last_date):
         return "Shock", median_mom
 
 
-def run_inference(top_k=5, min_score_threshold=0.6):
+def run_inference(top_k=5, min_score_threshold=Config.MIN_SCORE_THRESHOLD):
     print("\n" + "=" * 50)
     print(">>> 启动全市场每日选股")
     print("=" * 50)
@@ -75,7 +75,9 @@ def run_inference(top_k=5, min_score_threshold=0.6):
         print("❌ 无符合条件股票")
         return []
 
-    batch_size = 128
+    batch_size = Config.INFERENCE_BATCH_SIZE
+    print(f"正在对 {len(candidates)} 只活跃股票进行评分...")
+
     with torch.no_grad():
         for i in range(0, len(candidates), batch_size):
             batch_items = candidates[i: i + batch_size]
@@ -108,13 +110,11 @@ def run_inference(top_k=5, min_score_threshold=0.6):
         pe_str = f"{pe:.2f}" if pd.notna(pe) and pe != 0 else "-"
         print(f"{rank:<5} | {code:<10} | {score:.6f}     | {pe_str:<10} | {advice}")
 
-        # 【核心修复】只收集建议“买入”的股票
         if advice == "买入":
             final_picks.append((code, score, pe))
 
     print("=" * 60)
 
-    # 【核心修复】返回风控过滤后的列表，而不是原始列表
     if len(final_picks) < len(top_stocks):
         print(f"💡 风控生效：原始选出 {len(top_stocks)} 只 -> 最终保留 {len(final_picks)} 只")
 

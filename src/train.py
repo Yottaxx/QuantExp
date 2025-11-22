@@ -62,7 +62,7 @@ def run_training():
         save_total_limit=3,
 
         logging_steps=50,
-        fp16=True,
+        fp16=torch.cuda.is_available(),
         dataloader_num_workers=0,
 
         load_best_model_at_end=True,

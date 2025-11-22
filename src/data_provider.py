@@ -28,7 +28,8 @@ class DataProvider:
 
     @staticmethod
     def _setup_proxy_env():
-        proxy_url = "http://127.0.0.1:7890"
+        """设置代理：从 Config 读取"""
+        proxy_url = Config.PROXY_URL
         for k in ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']:
             os.environ[k] = proxy_url
 
@@ -43,7 +44,8 @@ class DataProvider:
     @staticmethod
     def _get_latest_trading_date():
         try:
-            df = ak.stock_zh_index_daily(symbol="sh000001")
+            # 使用 Config 中的市场指数代码
+            df = ak.stock_zh_index_daily(symbol=Config.MARKET_INDEX_SYMBOL)
             return pd.to_datetime(df['date']).max().date().strftime("%Y-%m-%d")
         except:
             return datetime.date.today().strftime("%Y-%m-%d")
@@ -83,7 +85,6 @@ class DataProvider:
 
     @staticmethod
     def _download_worker(code):
-        """下载日线行情 (修正版：仅保留真实交易日)"""
         path = os.path.join(Config.DATA_DIR, f"{code}.parquet")
         for attempt in range(5):
             try:
@@ -97,21 +98,12 @@ class DataProvider:
                 df['date'] = pd.to_datetime(df['date'])
                 df.set_index('date', inplace=True)
 
-                # 安全类型转换
                 for col in ['open', 'close', 'high', 'low', 'volume']:
                     if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').astype(np.float32)
 
-                # 剔除空值
                 df.dropna(inplace=True)
 
-                # 【核心修正】
-                # 移除之前的 reindex(freq='D') 和 ffill() 逻辑。
-                # 直接使用 AkShare 返回的真实交易日数据。
-                # 这样 shift(-N) 代表的就是真实的 "N个交易日后"，而非 "N个自然日后"。
-                # 同时避免了节假日填充导致的虚假低波动。
-
-                if len(df) > 0:
-                    df.to_parquet(path)
+                if len(df) > 0: df.to_parquet(path)
                 return code, True, "Success"
             except:
                 DataProvider._safe_switch_vpn()
@@ -253,8 +245,6 @@ class DataProvider:
         panel_df = panel_df.groupby('code', group_keys=False).apply(lambda x: AlphaFactory(x).make_factors())
 
         print("构造实盘预测目标 (Execution-Adjusted Target)...")
-        # 注意：这里的 shift 是基于行号的，现在行号严格对应交易日
-        # shift(-1) 就是下一个交易日，shift(-5) 就是5个交易日后
         panel_df['next_open'] = panel_df.groupby('code')['open'].shift(-1)
         panel_df['future_close'] = panel_df.groupby('code')['close'].shift(-Config.PRED_LEN)
         panel_df['target'] = panel_df['future_close'] / panel_df['next_open'] - 1
@@ -272,9 +262,9 @@ class DataProvider:
         panel_df = panel_df.set_index('date')
         panel_df = AlphaFactory.add_cross_sectional_factors(panel_df)
 
+        # 使用 Config 中的前缀配置进行筛选
         feature_cols = [c for c in panel_df.columns
-                        if any(c.startswith(p) for p in
-                               ['style_', 'tech_', 'alpha_', 'adv_', 'ind_', 'fund_', 'cs_rank_', 'mkt_', 'rel_'])]
+                        if any(c.startswith(p) for p in Config.FEATURE_PREFIXES)]
 
         panel_df[feature_cols] = panel_df[feature_cols].fillna(0).astype(np.float32)
         panel_df = panel_df.reset_index()
@@ -288,7 +278,7 @@ class DataProvider:
         return panel_df, feature_cols
 
     # --------------------------------------------------------------------------
-    # PART 4: Dataset 封装 (保持不变)
+    # PART 4: Dataset 封装
     # --------------------------------------------------------------------------
     @staticmethod
     def make_dataset(panel_df, feature_cols):
