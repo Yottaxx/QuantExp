@@ -22,6 +22,10 @@ class DataProvider:
     _vpn_lock = threading.Lock()
     _last_switch_time = 0
 
+    # --------------------------------------------------------------------------
+    # PART 1: 基础设施
+    # --------------------------------------------------------------------------
+
     @staticmethod
     def _setup_proxy_env():
         proxy_url = "http://127.0.0.1:7890"
@@ -49,14 +53,17 @@ class DataProvider:
         fund_dir = os.path.join(Config.DATA_DIR, "fundamental")
         if not os.path.exists(fund_dir): os.makedirs(fund_dir)
         path = os.path.join(fund_dir, f"{code}.parquet")
+
         if os.path.exists(path):
             mtime = os.path.getmtime(path)
             if (time.time() - mtime) < 7 * 24 * 3600: return code, True, "Skipped"
+
         for attempt in range(3):
             try:
                 time.sleep(random.uniform(0.1, 0.5))
                 df = ak.stock_financial_analysis_indicator_em(symbol=code)
                 if df is None or df.empty: return code, True, "Empty"
+
                 df['date'] = pd.to_datetime(df['日期'])
                 cols_map = {'加权净资产收益率': 'roe', '主营业务收入增长率(%)': 'rev_growth',
                             '净利润增长率(%)': 'profit_growth', '资产负债率(%)': 'debt_ratio', '市盈率(动态)': 'pe_ttm',
@@ -76,28 +83,35 @@ class DataProvider:
 
     @staticmethod
     def _download_worker(code):
+        """下载日线行情 (修正版：仅保留真实交易日)"""
         path = os.path.join(Config.DATA_DIR, f"{code}.parquet")
         for attempt in range(5):
             try:
                 time.sleep(random.uniform(0.05, 0.2))
                 df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=Config.START_DATE, adjust="qfq")
+
                 if df is None or df.empty: return code, True, "Empty"
-                df.rename(columns={'日期': 'date', '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low',
-                                   '成交量': 'volume'}, inplace=True)
+
+                df.rename(columns={'日期': 'date', '开盘': 'open', '收盘': 'close',
+                                   '最高': 'high', '最低': 'low', '成交量': 'volume'}, inplace=True)
                 df['date'] = pd.to_datetime(df['date'])
                 df.set_index('date', inplace=True)
+
+                # 安全类型转换
                 for col in ['open', 'close', 'high', 'low', 'volume']:
                     if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').astype(np.float32)
+
+                # 剔除空值
                 df.dropna(inplace=True)
-                if not df.empty:
-                    # 交易日历对齐修复
-                    full_idx = pd.date_range(start=df.index.min(), end=df.index.max(), freq='D')
-                    df = df.reindex(full_idx)
-                    if 'volume' in df.columns: df['volume'] = df['volume'].fillna(0)
-                    df = df.ffill()
-                    df.dropna(inplace=True)
-                    df = df[df.index.dayofweek < 5]
-                if len(df) > 0: df.to_parquet(path)
+
+                # 【核心修正】
+                # 移除之前的 reindex(freq='D') 和 ffill() 逻辑。
+                # 直接使用 AkShare 返回的真实交易日数据。
+                # 这样 shift(-N) 代表的就是真实的 "N个交易日后"，而非 "N个自然日后"。
+                # 同时避免了节假日填充导致的虚假低波动。
+
+                if len(df) > 0:
+                    df.to_parquet(path)
                 return code, True, "Success"
             except:
                 DataProvider._safe_switch_vpn()
@@ -109,13 +123,17 @@ class DataProvider:
         print(">>> [Phase 1] 启动全量数据下载...")
         DataProvider._setup_proxy_env()
         if not os.path.exists(Config.DATA_DIR): os.makedirs(Config.DATA_DIR)
+
         try:
             stock_info = ak.stock_zh_a_spot_em()
             codes = stock_info['代码'].tolist()
         except:
             print("❌ 无法获取股票列表")
             return
+
         target_date_str = DataProvider._get_latest_trading_date()
+        print(f"📅 市场最新交易日: {target_date_str}")
+
         existing_fresh = set()
         files = os.listdir(Config.DATA_DIR)
         for fname in files:
@@ -125,20 +143,24 @@ class DataProvider:
                     mtime = os.path.getmtime(fpath)
                     file_date = datetime.date.fromtimestamp(mtime).strftime("%Y-%m-%d")
                     if file_date >= target_date_str: existing_fresh.add(fname.replace(".parquet", ""))
+
         todo_price = list(set(codes) - existing_fresh)
         todo_price.sort()
+
         if todo_price:
+            print(f"待更新行情: {len(todo_price)}")
             with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
                 futures = {executor.submit(DataProvider._download_worker, c): c for c in todo_price}
                 for _ in tqdm(concurrent.futures.as_completed(futures), total=len(todo_price), desc="Price"): pass
         else:
             print("✅ 日线行情已是最新。")
+
         fund_dir = os.path.join(Config.DATA_DIR, "fundamental")
         if not os.path.exists(fund_dir): os.makedirs(fund_dir)
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(DataProvider._download_finance_worker, c): c for c in codes}
             for _ in tqdm(concurrent.futures.as_completed(futures), total=len(codes), desc="Finance"): pass
-        print("所有数据同步完成。")
+        print("同步完成。")
 
     @staticmethod
     def _get_cache_path(mode):
@@ -158,6 +180,9 @@ class DataProvider:
         print(f"过滤完成。移除样本: {original_len - new_len} ({1 - new_len / original_len:.2%})")
         return panel_df
 
+    # --------------------------------------------------------------------------
+    # PART 3: Panel 加载与融合
+    # --------------------------------------------------------------------------
     @staticmethod
     def load_and_process_panel(mode='train', force_refresh=False):
         cache_path = DataProvider._get_cache_path(mode)
@@ -173,6 +198,8 @@ class DataProvider:
         price_files = glob.glob(os.path.join(Config.DATA_DIR, "*.parquet"))
         fund_dir = os.path.join(Config.DATA_DIR, "fundamental")
 
+        print("加载行情数据...")
+
         def _read_price(f):
             try:
                 df = pd.read_parquet(f)
@@ -186,26 +213,28 @@ class DataProvider:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             results = list(tqdm(executor.map(_read_price, price_files), total=len(price_files), desc="Reading Price"))
+
         data_frames = [df for df in results if df is not None and len(df) > Config.CONTEXT_LEN]
         if not data_frames: raise ValueError("有效数据为空")
+
         panel_df = pd.concat(data_frames, ignore_index=False)
         del data_frames
         panel_df['code'] = panel_df['code'].astype(str)
 
-        print("正在加载并合并财务数据...")
+        print("合并财务数据...")
         fund_files = glob.glob(os.path.join(fund_dir, "*.parquet"))
 
         def _read_fund(f):
             try:
                 df = pd.read_parquet(f)
-                code = os.path.basename(f).replace(".parquet", "")
-                df['code'] = code
+                df['code'] = os.path.basename(f).replace(".parquet", "")
                 return df
             except:
                 return None
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             fund_frames = [df for df in executor.map(_read_fund, fund_files) if df is not None]
+
         if fund_frames:
             fund_df = pd.concat(fund_frames)
             fund_df = fund_df.reset_index().sort_values(['code', 'date'])
@@ -224,6 +253,8 @@ class DataProvider:
         panel_df = panel_df.groupby('code', group_keys=False).apply(lambda x: AlphaFactory(x).make_factors())
 
         print("构造实盘预测目标 (Execution-Adjusted Target)...")
+        # 注意：这里的 shift 是基于行号的，现在行号严格对应交易日
+        # shift(-1) 就是下一个交易日，shift(-5) 就是5个交易日后
         panel_df['next_open'] = panel_df.groupby('code')['open'].shift(-1)
         panel_df['future_close'] = panel_df.groupby('code')['close'].shift(-Config.PRED_LEN)
         panel_df['target'] = panel_df['future_close'] / panel_df['next_open'] - 1
@@ -256,6 +287,9 @@ class DataProvider:
 
         return panel_df, feature_cols
 
+    # --------------------------------------------------------------------------
+    # PART 4: Dataset 封装 (保持不变)
+    # --------------------------------------------------------------------------
     @staticmethod
     def make_dataset(panel_df, feature_cols):
         print(">>> [Phase 3] 转换 Dataset...")

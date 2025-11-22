@@ -19,7 +19,10 @@ class BacktestAnalyzer:
         self.results_df = None
 
     def generate_historical_predictions(self):
-        """全量历史回溯推理"""
+        """
+        全量历史回溯推理
+        逻辑：使用训练好的模型，对过去每一天的全市场股票进行打分
+        """
         print("\n" + "=" * 60)
         print(">>> 启动全量截面分析 (Full Cross-Sectional Analysis)")
         print("=" * 60)
@@ -32,13 +35,14 @@ class BacktestAnalyzer:
         model = PatchTSTForStock.from_pretrained(self.model_path).to(self.device)
         model.eval()
 
-        # 1. 加载数据 (Train 模式以获取 Target，利用缓存)
-        print("加载全市场 Panel 数据...")
+        # 1. 加载数据 (Train 模式，因为我们需要 Target/Label 来验证效果)
+        # 利用缓存加速
+        print("加载全市场 Panel 数据 (验证模式)...")
         panel_df, feature_cols = DataProvider.load_and_process_panel(mode='train')
 
-        # 2. 筛选时间段 (为了回测效率，只取目标区间)
-        # 注意：要多取 Config.CONTEXT_LEN 天，以便为 start_date 生成窗口
-        mask_date = (panel_df['date'] >= (self.start_date - pd.Timedelta(days=60))) & \
+        # 2. 筛选时间段 (为了回测效率，只取目标区间 + 窗口期)
+        # start_date 往前推 Context_Len 天，确保第一天就能构建窗口
+        mask_date = (panel_df['date'] >= (self.start_date - pd.Timedelta(days=Config.CONTEXT_LEN * 2))) & \
                     (panel_df['date'] <= self.end_date)
         df_sub = panel_df[mask_date].copy()
 
@@ -46,44 +50,40 @@ class BacktestAnalyzer:
             print("❌ 选定区间无数据")
             return
 
-        # 3. 批量推理
-        # 策略：按 Code 分组，利用 Numpy 快速切片构建 Batch
         print("正在构建时序窗口并推理...")
 
         all_results = []
-        batch_size = 2048
+        batch_size = 2048  # 根据显存调整
         batch_inputs = []
-        batch_meta = []  # (date, code, label, excess)
+        batch_meta = []  # (date, code, rank_label, excess_label)
 
         grouped = df_sub.groupby('code')
 
         for code, group in tqdm(grouped, desc="Processing Stocks"):
             if len(group) < Config.CONTEXT_LEN: continue
 
-            # 提取 Numpy 数组
+            # 提取 Numpy 数组 (Float32)
             feats = group[feature_cols].values.astype(np.float32)
             dates = group['date'].values
 
-            # 目标值 (优先用 rank_label 验证模型能力，用 excess_label 验证赚钱能力)
-            # 注意：Panel 中可能包含 rank_label, excess_label, target
-            # 我们这里主要记录 excess_label 用于分层回测
-            if 'excess_label' in group.columns:
-                labels = group['excess_label'].values
-            else:
-                labels = group['target'].values
+            # 获取验证用的真实标签
+            # rank_label: 0~1, 用于计算 IC
+            # excess_label: 真实超额收益, 用于画资金曲线
+            # target: 实盘绝对收益 (Close_N / Open_1 - 1)
+
+            # 优先获取预计算好的标签，如果没有则 fallback
+            ranks = group['rank_label'].values if 'rank_label' in group.columns else np.zeros(len(group))
+            excess = group['excess_label'].values if 'excess_label' in group.columns else group['target'].values
 
             # 滑动窗口切片
-            # 我们需要预测的时间点是从 start_date 开始的
-            # 窗口 i 对应的数据是 [i : i+seq_len]，预测的是 i+seq_len-1 那个时间点的 Label
-
+            # i 是窗口起点，预测的是 i + seq_len - 1 这个时间点的表现
             seq_len = Config.CONTEXT_LEN
 
-            # 找到符合时间范围的起始索引
-            # dates[i + seq_len - 1] >= self.start_date
-
-            valid_indices = []
             for i in range(len(group) - seq_len + 1):
-                pred_date = pd.to_datetime(dates[i + seq_len - 1])
+                # 预测日期是窗口的最后一天
+                pred_date_ts = dates[i + seq_len - 1]
+                pred_date = pd.to_datetime(pred_date_ts)
+
                 if pred_date < self.start_date or pred_date > self.end_date:
                     continue
 
@@ -92,7 +92,8 @@ class BacktestAnalyzer:
                 batch_meta.append({
                     'date': pred_date,
                     'code': code,
-                    'label': labels[i + seq_len - 1]
+                    'rank_label': ranks[i + seq_len - 1],
+                    'excess_label': excess[i + seq_len - 1]
                 })
 
                 if len(batch_inputs) >= batch_size:
@@ -123,59 +124,73 @@ class BacktestAnalyzer:
     def analyze_performance(self):
         if self.results_df is None or self.results_df.empty: return
 
+        # 按日期和分数排序
         df = self.results_df.sort_values(['date', 'score'], ascending=[True, False])
 
         print("\n计算截面 IC 指标...")
-        # Rank IC: 预测分 vs 实际超额收益
+
+        # 1. 计算 Rank IC (Spearman Correlation)
+        # 预测分(score) vs 真实排名(rank_label)
+        # 如果模型好，预测分高的地方，真实排名也应该靠前(接近1.0)
         daily_ic = df.groupby('date').apply(
-            lambda x: spearmanr(x['score'], x['label'])[0]
+            lambda x: spearmanr(x['score'], x['rank_label'])[0]
         )
 
         ic_mean = daily_ic.mean()
-        icir = ic_mean / (daily_ic.std() + 1e-9) * np.sqrt(252)
+        ic_std = daily_ic.std()
+        # 年化 ICIR = IC均值 / IC波动率 * sqrt(252)
+        icir = ic_mean / (ic_std + 1e-9) * np.sqrt(252)
 
         print("-" * 40)
         print(f"📊 【因子绩效报告】")
-        print(f"Rank IC (Mean): {ic_mean:.4f}")
-        print(f"ICIR (Annual) : {icir:.4f}")
+        print(f"Rank IC (Mean): {ic_mean:.4f}  (>0.05 优秀)")
+        print(f"ICIR (Annual) : {icir:.4f}    (>2.0 稳定)")
         print(f"IC Win Rate   : {(daily_ic > 0).mean():.2%}")
         print("-" * 40)
 
-        # 分层回测
+        # 2. 分层回测 (Layered Backtest)
+        # 将每日股票按分数分为 5 组，看每组的平均超额收益
         def get_layer_ret(g):
             try:
                 # 分5组，label=4是最高分(Long)，label=0是最低分(Short)
                 g['group'] = pd.qcut(g['score'], 5, labels=False, duplicates='drop')
-                return g.groupby('group')['label'].mean()
+                # 计算每组的平均超额收益
+                return g.groupby('group')['excess_label'].mean()
             except:
                 return None
 
         layer_ret = df.groupby('date').apply(get_layer_ret)
 
         if layer_ret is not None:
+            # 累积收益
             cum_ret = (1 + layer_ret).cumprod()
+            # 多空收益 = Top - Bottom
             long_short = (1 + (layer_ret[4] - layer_ret[0])).cumprod()
 
             plt.figure(figsize=(14, 8))
+
+            # 子图1: 分层收益曲线
             plt.subplot(2, 1, 1)
             colors = ['green', 'lime', 'grey', 'orange', 'red']
+            labels = ['Bottom 20%', '40%-60%', 'Middle', '60%-80%', 'Top 20%']
+
             for i in range(5):
                 if i in cum_ret.columns:
-                    label = "Top 20% (Long)" if i == 4 else f"Group {i}"
-                    label = "Bottom 20% (Short)" if i == 0 else label
-                    plt.plot(cum_ret.index, cum_ret[i], label=label, color=colors[i])
+                    plt.plot(cum_ret.index, cum_ret[i], label=labels[i], color=colors[i], alpha=0.8)
 
             plt.plot(long_short.index, long_short, label='Long-Short (Alpha)', color='blue', linestyle='--',
                      linewidth=2)
             plt.title('Layered Backtest (Cumulative Excess Return)')
-            plt.legend()
+            plt.legend(loc='upper left')
             plt.grid(True, alpha=0.3)
 
+            # 子图2: 每日 IC 柱状图
             plt.subplot(2, 1, 2)
             plt.bar(daily_ic.index, daily_ic.values, color='orange', alpha=0.5, label='Daily IC')
-            plt.axhline(ic_mean, color='red', linestyle='--')
-            plt.title('Daily Rank IC')
+            plt.axhline(ic_mean, color='red', linestyle='--', label=f'Mean IC: {ic_mean:.3f}')
+            plt.title('Daily Rank IC Series')
             plt.legend()
+            plt.grid(True, alpha=0.3)
 
             save_path = os.path.join(Config.OUTPUT_DIR, "cross_section_analysis.png")
             plt.tight_layout()

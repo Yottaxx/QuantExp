@@ -9,13 +9,17 @@ for k in ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY',
 from src.data_provider import DataProvider
 from src.train import run_training
 from src.inference import run_inference
-from src.backtest import run_backtest
+# 引入新的回测入口
+from src.backtest import run_walk_forward_backtest
 from src.analysis import BacktestAnalyzer
 from src.config import Config
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SOTA Quant System v7.2")
-    parser.add_argument('--mode', type=str, required=True, choices=['download', 'train', 'predict', 'analysis'])
+    parser = argparse.ArgumentParser(description="SOTA Quant System v8.0")
+    # 新增 backtest 模式选项
+    parser.add_argument('--mode', type=str, required=True,
+                        choices=['download', 'train', 'predict', 'analysis', 'backtest'],
+                        help='运行模式')
     parser.add_argument('--cash', type=float, default=1000000.0)
     parser.add_argument('--top_k', type=int, default=5)
     parser.add_argument('--start_date', type=str, default='2024-01-01')
@@ -32,17 +36,29 @@ if __name__ == "__main__":
 
     if args.mode == 'download':
         DataProvider.download_data()
+
     elif args.mode == 'train':
         if args.force_refresh:
             p = DataProvider._get_cache_path('train')
             if os.path.exists(p): os.remove(p)
         run_training()
+
     elif args.mode == 'predict':
         if args.force_refresh:
             p = DataProvider._get_cache_path('predict')
             if os.path.exists(p): os.remove(p)
-        top = run_inference(top_k=args.top_k)
-        if top: run_backtest(top, initial_cash=args.cash)
+        # 预测模式仅输出选股结果，不再进行“伪回测”
+        run_inference(top_k=args.top_k)
+
+    elif args.mode == 'backtest':
+        # 真正的 Walk-Forward 回测入口
+        run_walk_forward_backtest(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            initial_cash=args.cash,
+            top_k=args.top_k
+        )
+
     elif args.mode == 'analysis':
         an = BacktestAnalyzer(start_date=args.start_date, end_date=args.end_date)
         an.generate_historical_predictions()
