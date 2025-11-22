@@ -22,7 +22,10 @@ class DataProvider:
     _vpn_lock = threading.Lock()
     _last_switch_time = 0
 
-    # ... [PART 1 基础设置 保持不变] ...
+    # --------------------------------------------------------------------------
+    # PART 1: 基础设施 (保持不变)
+    # --------------------------------------------------------------------------
+
     @staticmethod
     def _setup_proxy_env():
         proxy_url = "http://127.0.0.1:7890"
@@ -46,57 +49,39 @@ class DataProvider:
             return datetime.date.today().strftime("%Y-%m-%d")
 
     # --------------------------------------------------------------------------
-    # PART 1.5: 财务数据下载 (新增)
+    # PART 2: 下载模块 (保持不变)
     # --------------------------------------------------------------------------
     @staticmethod
     def _download_finance_worker(code):
-        """下载单只股票的财务指标"""
-        # 财务数据存放在单独的目录，避免和行情数据混淆
         fund_dir = os.path.join(Config.DATA_DIR, "fundamental")
         if not os.path.exists(fund_dir): os.makedirs(fund_dir)
         path = os.path.join(fund_dir, f"{code}.parquet")
 
-        # 财务数据更新频率低，如果文件存在且较新(7天内)，可以跳过
         if os.path.exists(path):
             mtime = os.path.getmtime(path)
-            if (time.time() - mtime) < 7 * 24 * 3600:  # 7天过期
-                return code, True, "Skipped"
+            if (time.time() - mtime) < 7 * 24 * 3600: return code, True, "Skipped"
 
         for attempt in range(3):
             try:
                 time.sleep(random.uniform(0.1, 0.5))
-                # 接口：东方财富-个股-财务分析-主要指标
-                # 包含: 每股收益, 净资产收益率(ROE), 资产负债率, 营收增长率, 净利润增长率等
                 df = ak.stock_financial_analysis_indicator_em(symbol=code)
-
                 if df is None or df.empty: return code, True, "Empty"
 
-                # 核心清洗：日期处理
-                # 东财返回的日期是 "2023-03-31"，这是报告期，不是公告期。
-                # 为了防止未来函数，我们需要做一个简单的处理：
-                # 默认假设财报在报告期后 45 天发布 (保守估计)
-                # 或者保留原始日期，在合并时做 shift
                 df['date'] = pd.to_datetime(df['日期'])
-
-                # 筛选核心字段
                 cols_map = {
                     '加权净资产收益率': 'roe',
                     '主营业务收入增长率(%)': 'rev_growth',
                     '净利润增长率(%)': 'profit_growth',
                     '资产负债率(%)': 'debt_ratio',
-                    '市盈率(动态)': 'pe_ttm',  # 注意：东财这个接口里的PE可能不准，最好用实时行情算
+                    '市盈率(动态)': 'pe_ttm',
                     '市净率': 'pb'
                 }
-
-                # 并非所有列都存在，取交集
                 valid_cols = [c for c in cols_map.keys() if c in df.columns]
                 df = df[['date'] + valid_cols].copy()
                 df.rename(columns=cols_map, inplace=True)
 
-                # 转 float32
                 for c in df.columns:
-                    if c != 'date':
-                        df[c] = pd.to_numeric(df[c], errors='coerce').astype(np.float32)
+                    if c != 'date': df[c] = pd.to_numeric(df[c], errors='coerce').astype(np.float32)
 
                 df.set_index('date', inplace=True)
                 df.to_parquet(path)
@@ -106,12 +91,8 @@ class DataProvider:
                 continue
         return code, False, "Failed"
 
-    # --------------------------------------------------------------------------
-    # PART 2: 下载模块 (含财务数据调度)
-    # --------------------------------------------------------------------------
     @staticmethod
     def _download_worker(code):
-        # ... [保持原有的行情下载逻辑不变] ...
         path = os.path.join(Config.DATA_DIR, f"{code}.parquet")
         for attempt in range(5):
             try:
@@ -129,7 +110,6 @@ class DataProvider:
                         df[col] = pd.to_numeric(df[col], errors='coerce').astype(np.float32)
                 df.dropna(inplace=True)
 
-                # 对齐时间
                 if not df.empty:
                     full_idx = pd.date_range(start=df.index.min(), end=df.index.max(), freq='D')
                     df = df.reindex(full_idx)
@@ -158,7 +138,6 @@ class DataProvider:
             print("❌ 无法获取股票列表")
             return
 
-        # 1. 下载日线行情
         print(">>> (1/2) 正在同步日线行情...")
         target_date_str = DataProvider._get_latest_trading_date()
         existing_fresh = set()
@@ -181,22 +160,16 @@ class DataProvider:
         else:
             print("✅ 日线行情已是最新。")
 
-        # 2. 下载财务数据 (独立线程池)
         print(">>> (2/2) 正在同步财务数据...")
-        # 财务数据不需要每天下，上面的 worker 内部有7天过期检查
-        # 这里直接把所有 code 扔进去，worker 会自己判断是否跳过
-        # 但为了效率，也可以在这里检查文件存在性
         fund_dir = os.path.join(Config.DATA_DIR, "fundamental")
         if not os.path.exists(fund_dir): os.makedirs(fund_dir)
 
-        # 简单起见，全量检查一遍
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(DataProvider._download_finance_worker, c): c for c in codes}
             for _ in tqdm(concurrent.futures.as_completed(futures), total=len(codes), desc="Finance"): pass
 
         print("所有数据同步完成。")
 
-    # ... [缓存路径和过滤逻辑保持不变] ...
     @staticmethod
     def _get_cache_path(mode):
         today_str = datetime.date.today().strftime("%Y%m%d")
@@ -204,7 +177,6 @@ class DataProvider:
 
     @staticmethod
     def _filter_universe(panel_df):
-        # ... [复用之前的过滤逻辑] ...
         print(">>> [Filtering] 正在执行动态股票池过滤...")
         original_len = len(panel_df)
         panel_df = panel_df[panel_df['volume'] > 0]
@@ -217,7 +189,7 @@ class DataProvider:
         return panel_df
 
     # --------------------------------------------------------------------------
-    # PART 3: Panel 加载与融合 (Merge Price & Fund)
+    # PART 3: Panel 加载与融合 (修复 KeyError Bug)
     # --------------------------------------------------------------------------
     @staticmethod
     def load_and_process_panel(mode='train', force_refresh=False):
@@ -276,34 +248,29 @@ class DataProvider:
             fund_results = list(executor.map(_read_fund, fund_files))
 
         fund_frames = [df for df in fund_results if df is not None]
+
         if fund_frames:
             fund_df = pd.concat(fund_frames)
             fund_df = fund_df.reset_index().sort_values(['code', 'date'])
 
-            # 【关键步骤】财务数据对齐
-            # 1. 财务数据是低频的，行情是高频的
-            # 2. 我们需要把财务数据根据 date 映射到行情数据上
-            # 3. 为了防未来函数，我们将财务数据的 date 向后推迟 2 个月 (60天)
-            #    作为"公告日"的保守估计 (因为一季报3.31，通常4月底发，甚至更晚)
-            #    或者更简单的做法：merge_asof
-
+            # 对齐日期 (公告日滞后处理)
             fund_df['announce_date'] = fund_df['date'] + pd.Timedelta(days=60)
             fund_df = fund_df.drop(columns=['date']).rename(columns={'announce_date': 'date'})
 
             # 重置索引以便 merge
             panel_df = panel_df.reset_index().sort_values(['code', 'date'])
 
-            # merge_asof 需要按 key 排序
+            # Merge Asof
             panel_df = pd.merge_asof(
                 panel_df,
                 fund_df,
                 on='date',
                 by='code',
-                direction='backward'  # 向后查找最近的一个财报
+                direction='backward'
             )
 
-            # 填充财务数据的空值 (上市初期可能没财报)
-            fund_cols = ['roe', 'rev_growth', 'profit_growth', 'debt_ratio']
+            # 填充空值
+            fund_cols = ['roe', 'rev_growth', 'profit_growth', 'debt_ratio', 'pe_ttm', 'pb']
             for c in fund_cols:
                 if c in panel_df.columns:
                     panel_df[c] = panel_df[c].fillna(0).astype(np.float32)
@@ -312,8 +279,14 @@ class DataProvider:
         else:
             print("⚠️ 未找到财务数据，跳过合并。")
 
-        panel_df = panel_df.set_index('date')  # 恢复索引
-        panel_df = panel_df.reset_index().sort_values(['code', 'date'])  # 确保顺序
+        # 【核心修复：条件索引恢复】
+        # 如果刚才没有执行 merge，date 还在 Index 里；如果执行了，date 变成了 Column
+        # 我们统一检查：如果 date 是 column，就 set_index；如果是 index，就不动
+        if 'date' in panel_df.columns:
+            panel_df = panel_df.set_index('date')
+
+        # 统一重置，确保后续格式一致
+        panel_df = panel_df.reset_index().sort_values(['code', 'date'])
 
         # --- 后续流程 (保持不变) ---
         print("计算时序因子...")
@@ -331,8 +304,7 @@ class DataProvider:
 
         feature_cols = [c for c in panel_df.columns
                         if any(c.startswith(p) for p in
-                               ['style_', 'tech_', 'alpha_', 'adv_', 'ind_', 'fund_', 'cs_rank_', 'mkt_',
-                                'rel_'])]  # 增加 fund_
+                               ['style_', 'tech_', 'alpha_', 'adv_', 'ind_', 'fund_', 'cs_rank_', 'mkt_', 'rel_'])]
 
         panel_df[feature_cols] = panel_df[feature_cols].fillna(0).astype(np.float32)
         panel_df = panel_df.reset_index()
