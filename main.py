@@ -15,12 +15,15 @@ from src.analysis import BacktestAnalyzer
 from src.config import Config
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SOTA Quant System v8.1")
+    parser = argparse.ArgumentParser(description="SOTA Quant System v8.2")
     parser.add_argument('--mode', type=str, required=True,
                         choices=['download', 'train', 'predict', 'analysis', 'backtest'],
                         help='运行模式')
     parser.add_argument('--cash', type=float, default=1000000.0)
-    parser.add_argument('--top_k', type=int, default=5)
+
+    # 【优化】使用 Config 默认值
+    parser.add_argument('--top_k', type=int, default=Config.TOP_K)
+
     parser.add_argument('--start_date', type=str, default='2024-01-01')
     parser.add_argument('--end_date', type=str, default='2025-12-31')
     parser.add_argument('--force_refresh', action='store_true')
@@ -47,21 +50,17 @@ if __name__ == "__main__":
             p = DataProvider._get_cache_path('predict')
             if os.path.exists(p): os.remove(p)
 
-        # 1. 获取选股结果
         top_stocks = run_inference(top_k=args.top_k)
 
-        # 2. 如果选出了股票，且希望看这些股票的历史表现（验证性回测）
         if top_stocks:
-            # 【对齐】传递 top_k
             run_backtest(top_stocks, initial_cash=args.cash, top_k=args.top_k)
 
     elif args.mode == 'backtest':
-        # 真正的 Walk-Forward 回测入口
         run_walk_forward_backtest(
             start_date=args.start_date,
             end_date=args.end_date,
             initial_cash=args.cash,
-            top_k=args.top_k  # 对齐
+            top_k=args.top_k
         )
 
     elif args.mode == 'analysis':

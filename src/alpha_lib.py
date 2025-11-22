@@ -6,7 +6,7 @@ from .config import Config
 
 class AlphaFactory:
     """
-    【SOTA 多因子构建工厂 v7.3】
+    【SOTA 多因子构建工厂 v7.4 - 鲁棒增强版】
     """
 
     def __init__(self, df: pd.DataFrame):
@@ -22,9 +22,13 @@ class AlphaFactory:
 
         self.returns = self.close.pct_change()
         self.vwap = (self.volume * (self.high + self.low + self.close) / 3).cumsum() / (self.volume.cumsum() + 1e-9)
-        self.log_ret = np.log(self.close / self.close.shift(1))
+
+        # 【修正】增加 1e-9 防止除零或 log(0)
+        # 旧代码: np.log(self.close / self.close.shift(1))
+        self.log_ret = np.log((self.close + 1e-9) / (self.close.shift(1) + 1e-9))
 
     def make_factors(self) -> pd.DataFrame:
+        """构建所有时间序列因子"""
         self._build_style_factors()
         self._build_technical_factors()
         self._build_fundamental_factors()
@@ -95,7 +99,7 @@ class AlphaFactory:
 
         return panel_df
 
-    # ... (Build functions omitted for brevity, same as before) ...
+    # ... [Build functions 保持不变] ...
     def _build_style_factors(self):
         self.df['style_mom_1m'] = ops.ts_sum(self.log_ret, 20)
         self.df['style_mom_3m'] = ops.ts_sum(self.log_ret, 60)
@@ -194,18 +198,14 @@ class AlphaFactory:
         self.df['time_moy'] = (dates.month - 6.5) / 5.5
 
     def _preprocess_factors(self):
-        # 使用 Config 中的统一前缀列表
         factor_cols = [c for c in self.df.columns
                        if any(c.startswith(p) for p in Config.FEATURE_PREFIXES)]
-
         self.df.replace([np.inf, -np.inf], np.nan, inplace=True)
         self.df[factor_cols] = self.df[factor_cols].fillna(method='ffill').fillna(0)
-
         for col in factor_cols:
             if col.startswith('time_'): continue
             series = self.df[col]
             series = ops.zscore(series, window=60)
             series = series.clip(-4, 4)
             self.df[col] = series
-
         self.df[factor_cols] = self.df[factor_cols].fillna(0)

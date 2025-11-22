@@ -8,18 +8,14 @@ from .model import PatchTSTForStock
 from .data_provider import DataProvider
 
 
+# ... [check_market_regime 保持不变] ...
 def check_market_regime(panel_df, last_date):
-    """市场温度计：牛熊判断"""
     daily_slice = panel_df[panel_df['date'] == last_date]
     if daily_slice.empty: return "Unknown", 0.0
-
-    # 上涨家数占比 (基于短期动量)
     up_count = (daily_slice['style_mom_1m'] > 0).sum()
     up_ratio = up_count / len(daily_slice)
     median_mom = daily_slice['style_mom_1m'].median()
-
     print(f"📊 市场状态: 上涨占比 {up_ratio:.2%} | 动量中位数 {median_mom:.4f}")
-
     if up_ratio < 0.4 or median_mom < -0.02:
         return "Bear", median_mom
     elif up_ratio > 0.6:
@@ -28,7 +24,10 @@ def check_market_regime(panel_df, last_date):
         return "Shock", median_mom
 
 
-def run_inference(top_k=5, min_score_threshold=Config.MIN_SCORE_THRESHOLD):
+def run_inference(top_k=Config.TOP_K, min_score_threshold=Config.MIN_SCORE_THRESHOLD):
+    """
+    【优化】使用全局配置默认值
+    """
     print("\n" + "=" * 50)
     print(">>> 启动全市场每日选股")
     print("=" * 50)
@@ -109,16 +108,11 @@ def run_inference(top_k=5, min_score_threshold=Config.MIN_SCORE_THRESHOLD):
         if score < min_score_threshold: advice = "观望"
         pe_str = f"{pe:.2f}" if pd.notna(pe) and pe != 0 else "-"
         print(f"{rank:<5} | {code:<10} | {score:.6f}     | {pe_str:<10} | {advice}")
-
-        if advice == "买入":
-            final_picks.append((code, score, pe))
+        if advice == "买入": final_picks.append((code, score, pe))
 
     print("=" * 60)
-
     if len(final_picks) < len(top_stocks):
-        print(f"💡 风控生效：原始选出 {len(top_stocks)} 只 -> 最终保留 {len(final_picks)} 只")
-
+        print(f"💡 风控生效：{len(top_stocks)} -> {len(final_picks)}")
     if not final_picks:
-        print("🛡️ 最终决策：空仓 (模型置信度不足或市场环境恶劣)")
-
+        print("🛡️ 最终决策：空仓")
     return final_picks
