@@ -1,3 +1,4 @@
+# ... [前面 import 保持不变] ...
 import akshare as ak
 import pandas as pd
 import os
@@ -22,15 +23,16 @@ class DataProvider:
     _vpn_lock = threading.Lock()
     _last_switch_time = 0
 
-    # --------------------------------------------------------------------------
-    # PART 1: 基础设施 (保持不变)
-    # --------------------------------------------------------------------------
-
+    # ... [PART 1: 下载模块 _setup_proxy_env 到 download_data 保持不变] ...
     @staticmethod
     def _setup_proxy_env():
         proxy_url = "http://127.0.0.1:7890"
-        for k in ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']:
-            os.environ[k] = proxy_url
+        os.environ['http_proxy'] = proxy_url
+        os.environ['https_proxy'] = proxy_url
+        os.environ['all_proxy'] = proxy_url
+        os.environ['HTTP_PROXY'] = proxy_url
+        os.environ['HTTPS_PROXY'] = proxy_url
+        os.environ['ALL_PROXY'] = proxy_url
 
     @classmethod
     def _safe_switch_vpn(cls):
@@ -48,41 +50,28 @@ class DataProvider:
         except:
             return datetime.date.today().strftime("%Y-%m-%d")
 
-    # --------------------------------------------------------------------------
-    # PART 2: 下载模块 (保持不变)
-    # --------------------------------------------------------------------------
     @staticmethod
     def _download_finance_worker(code):
         fund_dir = os.path.join(Config.DATA_DIR, "fundamental")
         if not os.path.exists(fund_dir): os.makedirs(fund_dir)
         path = os.path.join(fund_dir, f"{code}.parquet")
-
         if os.path.exists(path):
             mtime = os.path.getmtime(path)
             if (time.time() - mtime) < 7 * 24 * 3600: return code, True, "Skipped"
-
         for attempt in range(3):
             try:
                 time.sleep(random.uniform(0.1, 0.5))
                 df = ak.stock_financial_analysis_indicator_em(symbol=code)
                 if df is None or df.empty: return code, True, "Empty"
-
                 df['date'] = pd.to_datetime(df['日期'])
-                cols_map = {
-                    '加权净资产收益率': 'roe',
-                    '主营业务收入增长率(%)': 'rev_growth',
-                    '净利润增长率(%)': 'profit_growth',
-                    '资产负债率(%)': 'debt_ratio',
-                    '市盈率(动态)': 'pe_ttm',
-                    '市净率': 'pb'
-                }
+                cols_map = {'加权净资产收益率': 'roe', '主营业务收入增长率(%)': 'rev_growth',
+                            '净利润增长率(%)': 'profit_growth', '资产负债率(%)': 'debt_ratio', '市盈率(动态)': 'pe_ttm',
+                            '市净率': 'pb'}
                 valid_cols = [c for c in cols_map.keys() if c in df.columns]
                 df = df[['date'] + valid_cols].copy()
                 df.rename(columns=cols_map, inplace=True)
-
                 for c in df.columns:
                     if c != 'date': df[c] = pd.to_numeric(df[c], errors='coerce').astype(np.float32)
-
                 df.set_index('date', inplace=True)
                 df.to_parquet(path)
                 return code, True, "Success"
@@ -99,17 +88,13 @@ class DataProvider:
                 time.sleep(random.uniform(0.05, 0.2))
                 df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=Config.START_DATE, adjust="qfq")
                 if df is None or df.empty: return code, True, "Empty"
-
-                df.rename(columns={'日期': 'date', '开盘': 'open', '收盘': 'close',
-                                   '最高': 'high', '最低': 'low', '成交量': 'volume'}, inplace=True)
+                df.rename(columns={'日期': 'date', '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low',
+                                   '成交量': 'volume'}, inplace=True)
                 df['date'] = pd.to_datetime(df['date'])
                 df.set_index('date', inplace=True)
-
                 for col in ['open', 'close', 'high', 'low', 'volume']:
-                    if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors='coerce').astype(np.float32)
+                    if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').astype(np.float32)
                 df.dropna(inplace=True)
-
                 if not df.empty:
                     full_idx = pd.date_range(start=df.index.min(), end=df.index.max(), freq='D')
                     df = df.reindex(full_idx)
@@ -117,7 +102,6 @@ class DataProvider:
                     df = df.ffill()
                     df.dropna(inplace=True)
                     df = df[df.index.dayofweek < 5]
-
                 if len(df) > 0: df.to_parquet(path)
                 return code, True, "Success"
             except:
@@ -127,18 +111,15 @@ class DataProvider:
 
     @staticmethod
     def download_data():
-        print(">>> [Phase 1] 启动全量数据下载 (行情 + 财务)...")
+        print(">>> [Phase 1] 启动全量数据下载...")
         DataProvider._setup_proxy_env()
         if not os.path.exists(Config.DATA_DIR): os.makedirs(Config.DATA_DIR)
-
         try:
             stock_info = ak.stock_zh_a_spot_em()
             codes = stock_info['代码'].tolist()
         except:
             print("❌ 无法获取股票列表")
             return
-
-        print(">>> (1/2) 正在同步日线行情...")
         target_date_str = DataProvider._get_latest_trading_date()
         existing_fresh = set()
         files = os.listdir(Config.DATA_DIR)
@@ -149,25 +130,19 @@ class DataProvider:
                     mtime = os.path.getmtime(fpath)
                     file_date = datetime.date.fromtimestamp(mtime).strftime("%Y-%m-%d")
                     if file_date >= target_date_str: existing_fresh.add(fname.replace(".parquet", ""))
-
         todo_price = list(set(codes) - existing_fresh)
         todo_price.sort()
-
         if todo_price:
             with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
                 futures = {executor.submit(DataProvider._download_worker, c): c for c in todo_price}
                 for _ in tqdm(concurrent.futures.as_completed(futures), total=len(todo_price), desc="Price"): pass
         else:
             print("✅ 日线行情已是最新。")
-
-        print(">>> (2/2) 正在同步财务数据...")
         fund_dir = os.path.join(Config.DATA_DIR, "fundamental")
         if not os.path.exists(fund_dir): os.makedirs(fund_dir)
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(DataProvider._download_finance_worker, c): c for c in codes}
             for _ in tqdm(concurrent.futures.as_completed(futures), total=len(codes), desc="Finance"): pass
-
         print("所有数据同步完成。")
 
     @staticmethod
@@ -189,7 +164,7 @@ class DataProvider:
         return panel_df
 
     # --------------------------------------------------------------------------
-    # PART 3: Panel 加载与融合 (修复 KeyError Bug)
+    # PART 3: Panel 加载与融合 (实盘目标函数修正版)
     # --------------------------------------------------------------------------
     @staticmethod
     def load_and_process_panel(mode='train', force_refresh=False):
@@ -204,7 +179,7 @@ class DataProvider:
 
         print(f"\n>>> [Phase 2] 构建全内存 Panel 数据 (Mode: {mode})...")
 
-        # 1. 读取行情数据
+        # 1. 读取行情
         print("正在加载行情数据...")
         price_files = glob.glob(os.path.join(Config.DATA_DIR, "*.parquet"))
         fund_dir = os.path.join(Config.DATA_DIR, "fundamental")
@@ -230,10 +205,9 @@ class DataProvider:
         del data_frames
         panel_df['code'] = panel_df['code'].astype(str)
 
-        # 2. 读取财务数据并合并
+        # 2. 财务数据融合
         print("正在加载并合并财务数据...")
         fund_files = glob.glob(os.path.join(fund_dir, "*.parquet"))
-        fund_frames = []
 
         def _read_fund(f):
             try:
@@ -245,56 +219,55 @@ class DataProvider:
                 return None
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            fund_results = list(executor.map(_read_fund, fund_files))
-
-        fund_frames = [df for df in fund_results if df is not None]
+            fund_frames = [df for df in executor.map(_read_fund, fund_files) if df is not None]
 
         if fund_frames:
             fund_df = pd.concat(fund_frames)
             fund_df = fund_df.reset_index().sort_values(['code', 'date'])
-
-            # 对齐日期 (公告日滞后处理)
             fund_df['announce_date'] = fund_df['date'] + pd.Timedelta(days=60)
             fund_df = fund_df.drop(columns=['date']).rename(columns={'announce_date': 'date'})
-
-            # 重置索引以便 merge
             panel_df = panel_df.reset_index().sort_values(['code', 'date'])
-
-            # Merge Asof
-            panel_df = pd.merge_asof(
-                panel_df,
-                fund_df,
-                on='date',
-                by='code',
-                direction='backward'
-            )
-
-            # 填充空值
-            fund_cols = ['roe', 'rev_growth', 'profit_growth', 'debt_ratio', 'pe_ttm', 'pb']
-            for c in fund_cols:
-                if c in panel_df.columns:
-                    panel_df[c] = panel_df[c].fillna(0).astype(np.float32)
-
+            panel_df = pd.merge_asof(panel_df, fund_df, on='date', by='code', direction='backward')
+            for c in ['roe', 'rev_growth', 'profit_growth', 'debt_ratio', 'pe_ttm', 'pb']:
+                if c in panel_df.columns: panel_df[c] = panel_df[c].fillna(0).astype(np.float32)
             print(f"财务数据合并完成。")
-        else:
-            print("⚠️ 未找到财务数据，跳过合并。")
 
-        # 【核心修复：条件索引恢复】
-        # 如果刚才没有执行 merge，date 还在 Index 里；如果执行了，date 变成了 Column
-        # 我们统一检查：如果 date 是 column，就 set_index；如果是 index，就不动
-        if 'date' in panel_df.columns:
-            panel_df = panel_df.set_index('date')
-
-        # 统一重置，确保后续格式一致
+        if 'date' in panel_df.columns: panel_df = panel_df.set_index('date')
         panel_df = panel_df.reset_index().sort_values(['code', 'date'])
 
-        # --- 后续流程 (保持不变) ---
+        # 3. 计算时序因子
         print("计算时序因子...")
         panel_df = panel_df.groupby('code', group_keys=False).apply(lambda x: AlphaFactory(x).make_factors())
 
-        print("构造 Target...")
-        panel_df['target'] = panel_df.groupby('code')['close'].shift(-Config.PRED_LEN) / panel_df['close'] - 1
-        if mode == 'train': panel_df.dropna(subset=['target'], inplace=True)
+        # ----------------------------------------------------------------------
+        # 【核心修正】构造实盘预测目标 (Execution-Adjusted Target)
+        # 旧逻辑: Close(T+k) / Close(T) - 1 (理论收益)
+        # 新逻辑: Close(T+k) / Open(T+1) - 1 (实盘次日开盘买入收益)
+        # ----------------------------------------------------------------------
+        print("正在构造预测目标 (Next Open Strategy)...")
+
+        # 获取 T+1 的开盘价 (Next Open)
+        panel_df['next_open'] = panel_df.groupby('code')['open'].shift(-1)
+
+        # 获取 T+k 的收盘价 (Future Close)
+        # 注意：这里假设持有 PRED_LEN 天。如果 PRED_LEN=5，即 T+1 买入，T+6 收盘卖出？
+        # 通常我们定义预测周期为从 T+1 开始持有 N 天。
+        # 这里的 shift(-Config.PRED_LEN) 实际上取的是 T + PRED_LEN 日的数据。
+        # 收益 = (T + PRED_LEN 收盘价) / (T + 1 开盘价) - 1
+        panel_df['future_close'] = panel_df.groupby('code')['close'].shift(-Config.PRED_LEN)
+
+        # 计算实盘收益率 Target
+        # 注意：如果是最后一两行，next_open 或 future_close 可能是 NaN，结果也是 NaN
+        panel_df['target'] = panel_df['future_close'] / panel_df['next_open'] - 1
+
+        # 清理临时列
+        panel_df.drop(columns=['next_open', 'future_close'], inplace=True)
+
+        if mode == 'train':
+            print("训练模式：剔除无标签的尾部数据...")
+            panel_df.dropna(subset=['target'], inplace=True)
+        else:
+            print("预测模式：保留尾部数据用于推理...")
 
         panel_df = DataProvider._filter_universe(panel_df)
 

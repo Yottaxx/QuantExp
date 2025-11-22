@@ -5,12 +5,14 @@ from . import factor_ops as ops
 
 class AlphaFactory:
     """
-    【SOTA 多因子构建工厂 v7.1 - 估值因子激活版】
+    【SOTA 多因子构建工厂 v7.2 - 索引安全版】
+
+    v7.2 核心修复：
+    修复了 add_cross_sectional_factors 中因索引不唯一导致的正交化(Orthogonalization)数据错乱 Bug。
     """
 
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
-        # 基础字段映射
         self.open = df['open']
         self.high = df['high']
         self.low = df['low']
@@ -28,7 +30,7 @@ class AlphaFactory:
         """构建所有时间序列因子"""
         self._build_style_factors()
         self._build_technical_factors()
-        self._build_fundamental_factors()  # 重点：这里将计算 PE 相关因子
+        self._build_fundamental_factors()
         self._build_sota_alphas()
         self._build_advanced_factors()
         self._build_industrial_factors()
@@ -37,29 +39,54 @@ class AlphaFactory:
         return self.df
 
     @staticmethod
+    def _orthogonalize_factors(df, factor_cols):
+        """对称正交化核心逻辑"""
+        M = df[factor_cols].fillna(0).values
+        # 标准化
+        M = (M - np.mean(M, axis=0)) / (np.std(M, axis=0) + 1e-9)
+        try:
+            U, S, Vh = np.linalg.svd(M, full_matrices=False)
+            M_orth = np.dot(U, Vh)
+            # 再次标准化保持尺度一致
+            M_orth = (M_orth - np.mean(M_orth, axis=0)) / (np.std(M_orth, axis=0) + 1e-9)
+            # 保持索引一致以便回填
+            return pd.DataFrame(M_orth, columns=factor_cols, index=df.index)
+        except:
+            return df[factor_cols]
+
+    @staticmethod
     def add_cross_sectional_factors(panel_df: pd.DataFrame) -> pd.DataFrame:
-        """截面增强"""
+        """截面增强：排名 + 市场交互 + 【正交化】"""
+
+        # 【核心修复】: 必须重置索引，确保每一行都有唯一的 RangeIndex
+        # 否则下面的 groupby apply update 会因为 date 索引重复而导致数据错位
+        if 'date' not in panel_df.columns:
+            panel_df = panel_df.reset_index()
+
+        # 确保 date 存在且是 datetime
+        # 此时 panel_df.index 是唯一的 RangeIndex
 
         def apply_cs_clean_and_rank(x):
             x = ops.winsorize(x, method='mad')
             rank_val = x.rank(pct=True)
             return (rank_val - 0.5) * 2
 
-        # 核心因子列表 (增加了 fund_ep)
         target_cols = [
             'style_mom_1m', 'style_vol_1m', 'style_liquidity',
             'tech_rsi_14', 'tech_kdj_j', 'tech_bb_width',
             'alpha_money_flow', 'adv_skew_20', 'alpha_006',
             'ind_yang_zhang_vol', 'ind_roll_spread', 'ind_max_ret',
-            'fund_ep', 'fund_roe', 'fund_growth'  # 新增基本面因子
+            'fund_ep', 'fund_roe', 'fund_growth'
         ]
 
         valid_cols = [c for c in target_cols if c in panel_df.columns]
 
+        # 1. 计算截面排名
         for col in valid_cols:
             new_col = f"cs_rank_{col}"
             panel_df[new_col] = panel_df.groupby('date')[col].transform(apply_cs_clean_and_rank)
 
+        # 2. 市场交互特征
         mkt_features = ['style_mom_1m', 'style_vol_1m', 'style_liquidity', 'alpha_006']
         mkt_valid = [c for c in mkt_features if c in panel_df.columns]
 
@@ -68,6 +95,24 @@ class AlphaFactory:
             panel_df[mkt_col_name] = panel_df.groupby('date')[col].transform('mean')
             panel_df[f"rel_{col}"] = panel_df[col] - panel_df[mkt_col_name]
 
+        # 3. 因子正交化 (修复版)
+        print(">>> [AlphaFactory] 正在进行风格因子正交化 (SVD)...")
+        style_cols = [c for c in panel_df.columns if c.startswith('style_')]
+
+        if style_cols:
+            # 这里的 apply 会返回一个新的 DataFrame，索引是原始 RangeIndex (因为 group_keys=False 或默认保留原索引结构)
+            # 但为了万无一失，我们显式处理
+            def apply_orth_wrapper(g):
+                return AlphaFactory._orthogonalize_factors(g, style_cols)
+
+            # 使用 group_keys=False 避免 Index 变成 MultiIndex (date, original_index)
+            # 这样返回的 orth_results 索引就是原始 RangeIndex，可以直接 update
+            orth_results = panel_df.groupby('date', group_keys=False)[style_cols].apply(apply_orth_wrapper)
+
+            # 安全更新
+            panel_df.update(orth_results)
+
+        # 4. 构造 Label
         if 'target' in panel_df.columns:
             panel_df['rank_label'] = panel_df.groupby('date')['target'].transform(lambda x: x.rank(pct=True))
             market_ret = panel_df.groupby('date')['target'].transform('mean')
@@ -75,10 +120,7 @@ class AlphaFactory:
 
         return panel_df
 
-    # ... [Style, Tech, SOTA, Advanced, Industrial, Calendar, Preprocess 函数保持不变] ...
-    # 为节省篇幅，这里仅展示被修改的 _build_fundamental_factors
-    # 请确保下面的函数体被正确替换进原文件，其他函数保留原样
-
+    # ... [其余 build 函数保持不变，为节省篇幅省略] ...
     def _build_style_factors(self):
         self.df['style_mom_1m'] = ops.ts_sum(self.log_ret, 20)
         self.df['style_mom_3m'] = ops.ts_sum(self.log_ret, 60)
@@ -117,36 +159,11 @@ class AlphaFactory:
         self.df['tech_bb_pctb'] = (self.close - lower) / (upper - lower + 1e-9)
 
     def _build_fundamental_factors(self):
-        """
-        【已激活】基本面因子 (Fundamental Factors)
-        注意：数据源 pe_ttm 等已经通过 DataProvider 注入
-        """
-        # [1. Value] 估值因子
-        # PE (市盈率) -> E/P (盈利收益率)
-        # 逻辑：使用倒数 (1/PE) 处理，原因：
-        # 1. 线性关系：E/P 越高越好（便宜），这与 Alpha 因子通常越大越好一致。
-        # 2. 连续性：当 PE 接近 0 或为负时，PE 值不连续，而 E/P 在 0 附近是连续的。
-        if 'pe_ttm' in self.df.columns:
-            # 避免除零，加上微小量
-            self.df['fund_ep'] = 1.0 / (self.df['pe_ttm'] + 1e-9)
-
-        # PB (市净率) -> B/P (账面市值比)
-        # 经典的 Fama-French 价值因子
-        if 'pb' in self.df.columns:
-            self.df['fund_bp'] = 1.0 / (self.df['pb'] + 1e-9)
-
-        # [2. Quality] 质量因子
-        if 'roe' in self.df.columns:
-            self.df['fund_roe'] = self.df['roe']
-
-        # [3. Growth] 成长因子
-        if 'profit_growth' in self.df.columns:
-            self.df['fund_growth'] = self.df['profit_growth']
-
-        # [4. Risk] 财务风险
-        if 'debt_ratio' in self.df.columns:
-            # 负债率越高，风险越高，取反
-            self.df['fund_safety'] = -1 * self.df['debt_ratio']
+        if 'pe_ttm' in self.df.columns: self.df['fund_ep'] = 1.0 / (self.df['pe_ttm'] + 1e-9)
+        if 'pb' in self.df.columns: self.df['fund_bp'] = 1.0 / (self.df['pb'] + 1e-9)
+        if 'roe' in self.df.columns: self.df['fund_roe'] = self.df['roe']
+        if 'profit_growth' in self.df.columns: self.df['fund_growth'] = self.df['profit_growth']
+        if 'debt_ratio' in self.df.columns: self.df['fund_safety'] = -1 * self.df['debt_ratio']
 
     def _build_sota_alphas(self):
         self.df['alpha_006'] = -1 * ops.ts_corr(self.open, self.volume, 10)
@@ -203,8 +220,7 @@ class AlphaFactory:
 
     def _preprocess_factors(self):
         factor_cols = [c for c in self.df.columns
-                       if any(c.startswith(p) for p in
-                              ['style_', 'tech_', 'alpha_', 'adv_', 'ind_', 'fund_', 'time_'])]  # Added fund_
+                       if any(c.startswith(p) for p in ['style_', 'tech_', 'alpha_', 'adv_', 'ind_', 'fund_', 'time_'])]
         self.df.replace([np.inf, -np.inf], np.nan, inplace=True)
         self.df[factor_cols] = self.df[factor_cols].fillna(method='ffill').fillna(0)
         for col in factor_cols:
