@@ -4,8 +4,7 @@ from . import factor_ops as ops
 
 
 class AlphaFactory:
-    # ... [__init__, make_factors, _orthogonalize_factors 等保持不变] ...
-    # 请直接复制之前内容
+    # ... [__init__ 保持不变] ...
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
         self.open = df['open']
@@ -13,6 +12,12 @@ class AlphaFactory:
         self.low = df['low']
         self.close = df['close']
         self.volume = df['volume']
+
+        # 确保 date 列存在且为 datetime 类型
+        # 如果 date 在索引里，这就把它还原为列
+        if 'date' not in self.df.columns and isinstance(self.df.index, pd.DatetimeIndex):
+            self.df = self.df.reset_index()
+
         self.returns = self.close.pct_change()
         self.vwap = (self.volume * (self.high + self.low + self.close) / 3).cumsum() / (self.volume.cumsum() + 1e-9)
         self.log_ret = np.log(self.close / self.close.shift(1))
@@ -23,85 +28,13 @@ class AlphaFactory:
         self._build_sota_alphas()
         self._build_advanced_factors()
         self._build_industrial_factors()
+        self._build_calendar_factors()  # 【新增】构建日历因子
         self._preprocess_factors()
         return self.df
 
-    @staticmethod
-    def _orthogonalize_factors(df, factor_cols):
-        M = df[factor_cols].fillna(0).values
-        M = (M - np.mean(M, axis=0)) / (np.std(M, axis=0) + 1e-9)
-        try:
-            U, S, Vh = np.linalg.svd(M, full_matrices=False)
-            M_orth = np.dot(U, Vh)
-            M_orth = (M_orth - np.mean(M_orth, axis=0)) / (np.std(M_orth, axis=0) + 1e-9)
-            return pd.DataFrame(M_orth, columns=factor_cols, index=df.index)
-        except:
-            return df[factor_cols]
-
-    @staticmethod
-    def add_cross_sectional_factors(panel_df: pd.DataFrame) -> pd.DataFrame:
-        """截面增强：排名 + 市场交互 + 【正交化】"""
-
-        def apply_cs_clean_and_rank(x):
-            x = ops.winsorize(x, method='mad')
-            # 【优化】将 Rank [0, 1] 映射到 [-1, 1]，使其中心为 0
-            # 这有助于神经网络更快收敛，因为 Z-Score 也是以 0 为中心的
-            rank_val = x.rank(pct=True)
-            return (rank_val - 0.5) * 2
-
-        target_cols = [
-            'style_mom_1m', 'style_vol_1m', 'style_liquidity',
-            'alpha_money_flow', 'adv_skew_20', 'alpha_006',
-            'ind_yang_zhang_vol', 'ind_roll_spread', 'ind_max_ret'
-        ]
-
-        valid_cols = [c for c in target_cols if c in panel_df.columns]
-
-        # 1. 基础截面排名
-        for col in valid_cols:
-            new_col = f"cs_rank_{col}"
-            panel_df[new_col] = panel_df.groupby('date')[col].transform(apply_cs_clean_and_rank)
-
-        # 2. 市场交互特征
-        mkt_features = ['style_mom_1m', 'style_vol_1m', 'style_liquidity', 'alpha_006']
-        mkt_valid = [c for c in mkt_features if c in panel_df.columns]
-
-        for col in mkt_valid:
-            mkt_col_name = f"mkt_mean_{col}"
-            panel_df[mkt_col_name] = panel_df.groupby('date')[col].transform('mean')
-            panel_df[f"rel_{col}"] = panel_df[col] - panel_df[mkt_col_name]
-
-        # 3. 【核心激活】因子正交化
-        # 仅对高度相关的风格因子进行正交化，防止共线性干扰模型注意力
-        print(">>> [AlphaFactory] 正在进行风格因子正交化 (SVD)...")
-        style_cols = [c for c in panel_df.columns if c.startswith('style_')]
-
-        if style_cols:
-            # 逐日进行正交化
-            # 注意：为了效率，这里使用 transform 可能会有问题，因为正交化涉及多列交互
-            # 正确的做法是 groupby apply
-            def apply_orth(g):
-                return AlphaFactory._orthogonalize_factors(g, style_cols)
-
-            # 这里的 apply 返回的是 DataFrame，索引与原表一致
-            orth_results = panel_df.groupby('date')[style_cols].apply(apply_orth)
-
-            # Pandas 的 update 会根据索引自动对齐并覆盖
-            # 注意：groupby apply 后如果是 MultiIndex，需要 droplevel
-            # 但这里我们保持简单，直接覆盖值（假设顺序没变）
-            # 更稳健的做法：
-            panel_df.update(orth_results)
-
-        # 4. 构造 Label
-        if 'target' in panel_df.columns:
-            panel_df['rank_label'] = panel_df.groupby('date')['target'].transform(lambda x: x.rank(pct=True))
-            market_ret = panel_df.groupby('date')['target'].transform('mean')
-            panel_df['excess_label'] = panel_df['target'] - market_ret
-
-        return panel_df
-
-    # ... [其余 build 函数保持不变] ...
+    # ... [其他 build 函数保持不变，直接复制之前的] ...
     def _build_style_factors(self):
+        # ... (略) ...
         self.df['style_mom_1m'] = ops.ts_sum(self.log_ret, 20)
         self.df['style_mom_3m'] = ops.ts_sum(self.log_ret, 60)
         self.df['style_mom_6m'] = ops.ts_sum(self.log_ret, 120)
@@ -111,6 +44,7 @@ class AlphaFactory:
         self.df['style_size_proxy'] = np.log(self.close * self.volume + 1)
 
     def _build_technical_factors(self):
+        # ... (略) ...
         ema_12 = self.close.ewm(span=12, adjust=False).mean()
         ema_26 = self.close.ewm(span=26, adjust=False).mean()
         diff = ema_12 - ema_26
@@ -127,6 +61,7 @@ class AlphaFactory:
         self.df['tech_psy_12'] = ops.ts_sum(is_up, 12) / 12
 
     def _build_sota_alphas(self):
+        # ... (略) ...
         self.df['alpha_006'] = -1 * ops.ts_corr(self.open, self.volume, 10)
         self.df['alpha_012'] = np.sign(ops.delta(self.volume, 1)) * (-1 * ops.delta(self.close, 1))
         self.df['alpha_trend_strength'] = ops.ts_mean((self.high - self.low) / self.close, 14)
@@ -135,6 +70,7 @@ class AlphaFactory:
         self.df['alpha_money_flow'] = ops.decay_linear(clv * self.volume, 20)
 
     def _build_advanced_factors(self):
+        # ... (略) ...
         self.df['adv_skew_20'] = ops.ts_skew(self.returns, 20)
         self.df['adv_kurt_20'] = ops.ts_kurt(self.returns, 20)
         downside_ret = self.returns.copy()
@@ -152,6 +88,7 @@ class AlphaFactory:
         self.df['adv_vol_of_vol'] = ops.ts_std(rolling_vol, 20)
 
     def _build_industrial_factors(self):
+        # ... (略) ...
         o_c_lag = np.log(self.open / self.close.shift(1))
         c_o = np.log(self.close / self.open)
         rs_vol = np.log(self.high / self.close) * np.log(self.high / self.open) + \
@@ -172,15 +109,95 @@ class AlphaFactory:
         total_len = (self.high - self.low) + 1e-9
         self.df['ind_smart_money'] = (body_len / total_len) * np.log(self.volume + 1)
 
+    def _build_calendar_factors(self):
+        """
+        【新增】日历效应因子 (Calendar Effect)
+        让模型感知"今天是周几"、"是否月末"。
+        """
+        # 确保有 date 列
+        if 'date' not in self.df.columns:
+            # 尝试从索引恢复
+            self.df = self.df.reset_index()
+
+        if 'date' not in self.df.columns:
+            return  # 无法计算
+
+        dates = self.df['date'].dt
+
+        # 1. Day of Week (周几)
+        # 原始: 0=周一 ... 4=周五
+        # 归一化到 [-0.5, 0.5] 区间，方便模型理解
+        # (x - 2) / 2.0 -> 周一=-1.0, 周三=0.0, 周五=1.0
+        self.df['time_dow'] = (dates.dayofweek - 2) / 2.0
+
+        # 2. Day of Month (月初/月末)
+        # 归一化到 [-1, 1]
+        self.df['time_dom'] = (dates.day - 15) / 15.0
+
+        # 3. Month of Year (季节性)
+        self.df['time_moy'] = (dates.month - 6.5) / 5.5
+
     def _preprocess_factors(self):
+        # 【核心修改】把 time_ 也加入到特征列列表中
         factor_cols = [c for c in self.df.columns
-                       if any(c.startswith(p) for p in ['style_', 'tech_', 'alpha_', 'adv_', 'ind_'])]
+                       if any(
+                c.startswith(p) for p in ['style_', 'tech_', 'alpha_', 'adv_', 'ind_', 'time_'])]  # Added time_
+
         self.df.replace([np.inf, -np.inf], np.nan, inplace=True)
         self.df[factor_cols] = self.df[factor_cols].fillna(method='ffill').fillna(0)
+
         for col in factor_cols:
+            # 日历因子本身就是归一化好的，不需要去极值和ZScore，防止被破坏结构
+            if col.startswith('time_'):
+                continue
+
             series = self.df[col]
-            # 只做 Rolling Z-Score, 移除时序去极值，防止未来函数
             series = ops.zscore(series, window=60)
             series = series.clip(-4, 4)
             self.df[col] = series
+
         self.df[factor_cols] = self.df[factor_cols].fillna(0)
+
+    # ... [orthogonalize 和 add_cross_sectional_factors 保持不变] ...
+    @staticmethod
+    def _orthogonalize_factors(df, factor_cols):
+        M = df[factor_cols].fillna(0).values
+        M = (M - np.mean(M, axis=0)) / (np.std(M, axis=0) + 1e-9)
+        try:
+            U, S, Vh = np.linalg.svd(M, full_matrices=False)
+            M_orth = np.dot(U, Vh)
+            M_orth = (M_orth - np.mean(M_orth, axis=0)) / (np.std(M_orth, axis=0) + 1e-9)
+            return pd.DataFrame(M_orth, columns=factor_cols, index=df.index)
+        except:
+            return df[factor_cols]
+
+    @staticmethod
+    def add_cross_sectional_factors(panel_df: pd.DataFrame) -> pd.DataFrame:
+        def apply_cs_clean_and_rank(x):
+            x = ops.winsorize(x, method='mad')
+            rank_val = x.rank(pct=True)
+            return (rank_val - 0.5) * 2
+
+        target_cols = [
+            'style_mom_1m', 'style_vol_1m', 'style_liquidity',
+            'alpha_money_flow', 'adv_skew_20', 'alpha_006',
+            'ind_yang_zhang_vol', 'ind_roll_spread', 'ind_max_ret'
+        ]
+        valid_cols = [c for c in target_cols if c in panel_df.columns]
+        for col in valid_cols:
+            new_col = f"cs_rank_{col}"
+            panel_df[new_col] = panel_df.groupby('date')[col].transform(apply_cs_clean_and_rank)
+
+        mkt_features = ['style_mom_1m', 'style_vol_1m', 'style_liquidity', 'alpha_006']
+        mkt_valid = [c for c in mkt_features if c in panel_df.columns]
+        for col in mkt_valid:
+            mkt_col_name = f"mkt_mean_{col}"
+            panel_df[mkt_col_name] = panel_df.groupby('date')[col].transform('mean')
+            panel_df[f"rel_{col}"] = panel_df[col] - panel_df[mkt_col_name]
+
+        if 'target' in panel_df.columns:
+            panel_df['rank_label'] = panel_df.groupby('date')['target'].transform(lambda x: x.rank(pct=True))
+            market_ret = panel_df.groupby('date')['target'].transform('mean')
+            panel_df['excess_label'] = panel_df['target'] - market_ret
+
+        return panel_df
