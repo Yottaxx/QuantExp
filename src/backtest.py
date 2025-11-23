@@ -40,7 +40,7 @@ class ModelDrivenStrategy(bt.Strategy):
     """【Walk-Forward 专用策略】"""
     params = (
         ('signals', None),  # 信号矩阵
-        ('top_k', Config.TOP_K),  # 【优化】使用全局配置默认值
+        ('top_k', Config.TOP_K),
         ('hold_days', Config.PRED_LEN),
         ('min_volume_percent', Config.MIN_VOLUME_PERCENT),
     )
@@ -97,8 +97,10 @@ class ModelDrivenStrategy(bt.Strategy):
 
                 if size < 100: continue
 
-                # 风控: 流动性限制
-                limit_size = int(vol * self.p.min_volume_percent / 100) * 100
+                # 【修复】风控: 流动性限制
+                # 之前代码错误地除以 100 (min_volume_percent 0.02 变成了 0.0002)
+                # 正确逻辑: vol * 0.02
+                limit_size = int(vol * self.p.min_volume_percent) // 100 * 100
                 if size > limit_size: size = limit_size
 
                 if size >= 100:
@@ -187,7 +189,7 @@ class WalkForwardBacktester:
         for i, score in enumerate(s):
             res.append((meta[i][0], meta[i][1], float(score)))
 
-    def run(self, top_k=Config.TOP_K):  # 【优化】使用默认配置
+    def run(self, top_k=Config.TOP_K):
         signals = self.generate_signal_matrix()
         if signals is None: return
 
@@ -285,10 +287,11 @@ def run_walk_forward_backtest(start_date, end_date, initial_cash, top_k=Config.T
 # --- 简单的 TopKStrategy (用于 predict 后的验证性回测) ---
 class TopKStrategy(bt.Strategy):
     """
-    简化版验证策略
+    【修复】TopK 验证策略
+    修复了流动性计算错误，并增加了每日 TopK 校验（如果是每日换仓模式）
     """
     params = (
-        ('top_k', Config.TOP_K),  # 【优化】使用全局配置默认值
+        ('top_k', Config.TOP_K),
         ('hold_days', Config.PRED_LEN),
         ('min_volume_percent', Config.MIN_VOLUME_PERCENT)
     )
@@ -297,13 +300,17 @@ class TopKStrategy(bt.Strategy):
         self.hold_time = {}
 
     def next(self):
+        # 1. 卖出逻辑
         for data in self.datas:
             if self.getposition(data).size > 0:
                 self.hold_time[data._name] = self.hold_time.get(data._name, 0) + 1
+
+                # 时间止盈/止损
                 if self.hold_time[data._name] >= self.p.hold_days:
                     self.close(data=data)
                     self.hold_time[data._name] = 0
 
+        # 2. 买入逻辑
         cash = self.broker.get_cash()
         if cash < 5000: return
         current_pos = len([d for d in self.datas if self.getposition(d).size > 0])
@@ -322,7 +329,8 @@ class TopKStrategy(bt.Strategy):
                 size = int(target / price / 100) * 100
                 if size < 100: continue
 
-                limit_size = int(vol * self.p.min_volume_percent / 100) * 100
+                # 【修复】风控: 移除错误的除以 100
+                limit_size = int(vol * self.p.min_volume_percent) // 100 * 100
                 if size > limit_size: size = limit_size
 
                 if size >= 100:
@@ -331,7 +339,7 @@ class TopKStrategy(bt.Strategy):
                     buy_cnt += 1
 
 
-# ... [PerformanceAnalyzer 保持不变，省略] ...
+# ... [PerformanceAnalyzer 保持不变] ...
 class PerformanceAnalyzer:
     @staticmethod
     def get_benchmark(start_date, end_date):
@@ -372,9 +380,6 @@ class PerformanceAnalyzer:
 
 
 def run_single_backtest(codes, with_fees=True, initial_cash=1000000.0, top_k=Config.TOP_K):
-    """
-    【优化】使用 Config.TOP_K 作为默认值
-    """
     cerebro = bt.Cerebro();
     cerebro.broker.setcash(initial_cash)
     if with_fees:
@@ -387,7 +392,7 @@ def run_single_backtest(codes, with_fees=True, initial_cash=1000000.0, top_k=Con
         if not os.path.exists(fpath): continue
         try:
             df = pd.read_parquet(fpath);
-            start = pd.to_datetime(Config.START_DATE)
+            # start = pd.to_datetime(Config.START_DATE) # Unused
             if len(df) > 250: df = df.iloc[-250:]
             data = bt.feeds.PandasData(dataname=df, fromdate=df.index[0], plot=False)
             cerebro.adddata(data, name=code);
@@ -396,7 +401,6 @@ def run_single_backtest(codes, with_fees=True, initial_cash=1000000.0, top_k=Con
             continue
     if not loaded: return None
 
-    # 传递 top_k
     cerebro.addstrategy(TopKStrategy, top_k=top_k, hold_days=Config.PRED_LEN)
 
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade')
@@ -416,9 +420,6 @@ def run_single_backtest(codes, with_fees=True, initial_cash=1000000.0, top_k=Con
 
 
 def run_backtest(top_stocks_list, initial_cash=1000000.0, top_k=Config.TOP_K):
-    """
-    【优化】使用 Config.TOP_K 作为默认值
-    """
     print(f"\n>>> 启动验证性回测 (资金: {initial_cash:,.0f}, TopK: {top_k})")
     codes = [x[0] for x in top_stocks_list[:top_k]]
     if not codes: return

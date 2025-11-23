@@ -85,7 +85,7 @@ class DataProvider:
     def _download_worker(code):
         """
         下载日线行情
-        【核心升级】增加单位自适应检测，防止 手/股 混淆
+        【修复】成交量单位自适应检测逻辑修正
         """
         path = os.path.join(Config.DATA_DIR, f"{code}.parquet")
         for attempt in range(5):
@@ -99,7 +99,7 @@ class DataProvider:
                 df.rename(columns={
                     '日期': 'date', '开盘': 'open', '收盘': 'close',
                     '最高': 'high', '最低': 'low',
-                    '成交量': 'volume', '成交额': 'amount'  # 引入amount
+                    '成交量': 'volume', '成交额': 'amount'
                 }, inplace=True)
 
                 df['date'] = pd.to_datetime(df['date'])
@@ -112,32 +112,33 @@ class DataProvider:
                 df.dropna(inplace=True)
 
                 # ----------------------------------------------------------
-                # 【单位自适应校准逻辑】
+                # 【修复】单位自适应校准逻辑
                 # ----------------------------------------------------------
                 if 'amount' in df.columns and 'volume' in df.columns and 'close' in df.columns:
-                    # 取非零数据进行校验
+                    # 关键修改：仅使用最近 20 个交易日的数据进行单位判断
+                    # 原因：QFQ 价格在历史久远时会非常小，导致 amount / (close * vol) 系统性偏大，从而误判为“手”
+                    # 在最近的交易日，QFQ 因子接近 1，判断才准确。
                     valid_sample = df[(df['volume'] > 0) & (df['amount'] > 0)].tail(20)
 
                     if not valid_sample.empty:
                         # 计算隐含乘数 = 成交额 / (收盘价 * 成交量)
-                        # 如果单位是"手"，这个值应该接近 100
-                        # 如果单位是"股"，这个值应该接近 1
+                        # 理论值：如果是"手"(100股)，值约为 100；如果是"股"，值约为 1
                         multiplier = (
                                     valid_sample['amount'] / (valid_sample['close'] * valid_sample['volume'])).median()
 
-                        # 容错判断 (考虑涨跌停或均价差异，阈值设宽一点)
+                        # 容错判断 (100 vs 1)
                         if multiplier > 50:
                             # 确实是"手"，转为"股"
                             df['volume'] = df['volume'] * 100
-                        # 否则认为是"股"或其他单位，保持不变
-                        # print(f"Code: {code}, Multiplier: {multiplier:.2f}, Adjustment: {'*100' if multiplier > 50 else 'None'}")
+                            # print(f"Code: {code} 单位调整: 手 -> 股 (*100)")
 
-                # 清理不再需要的 amount 列，节省空间
+                        # else: 单位已经是股，或数据异常，不做处理
+
+                # 依然清理 amount 节省空间（或者保留用于更精确的回测，这里暂时按原逻辑清理）
                 if 'amount' in df.columns:
                     df.drop(columns=['amount'], inplace=True)
 
                 if not df.empty:
-                    # 仅保留真实交易日
                     df.sort_index(inplace=True)
 
                 if len(df) > 0: df.to_parquet(path)
@@ -147,8 +148,6 @@ class DataProvider:
                 continue
         return code, False, "Failed"
 
-    # ... [以下 PART 2 & PART 3 & PART 4 保持不变，直接复用之前的代码] ...
-    # 请务必保留之前的 download_data, load_and_process_panel, make_dataset 等函数
 
     @staticmethod
     def download_data():
@@ -318,7 +317,6 @@ class DataProvider:
         panel_df = panel_df.sort_values(['code', 'date'])
         feature_matrix = panel_df[feature_cols].values.astype(np.float32)
 
-        # 【差异修正】动态判断填充值，防止数值污染
         if 'rank_label' in panel_df.columns:
             target_col = 'rank_label'
             fill_val = 0.5

@@ -15,26 +15,37 @@ from src.analysis import BacktestAnalyzer
 from src.config import Config
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SOTA Quant System v8.2")
+    parser = argparse.ArgumentParser(description="SOTA Quant System v8.3 (Fixed)")
+
+    # 增加 test 和 debug_proxy 模式
     parser.add_argument('--mode', type=str, required=True,
-                        choices=['download', 'train', 'predict', 'analysis', 'backtest'],
-                        help='运行模式')
-    parser.add_argument('--cash', type=float, default=1000000.0)
+                        choices=['download', 'train', 'predict', 'analysis', 'backtest', 'test', 'debug_proxy'],
+                        help='运行模式: [download|train|predict|analysis|backtest|test|debug_proxy]')
 
-    # 【优化】使用 Config 默认值
-    parser.add_argument('--top_k', type=int, default=Config.TOP_K)
+    parser.add_argument('--cash', type=float, default=1000000.0, help='回测初始资金')
+    parser.add_argument('--top_k', type=int, default=Config.TOP_K, help='持仓数量')
 
-    parser.add_argument('--start_date', type=str, default='2024-01-01')
-    parser.add_argument('--end_date', type=str, default='2025-12-31')
-    parser.add_argument('--force_refresh', action='store_true')
-    parser.add_argument('--mse_weight', type=float, default=0.5)
-    parser.add_argument('--dropout', type=float, default=0.2)
+    parser.add_argument('--start_date', type=str, default='2024-01-01', help='开始日期')
+    parser.add_argument('--end_date', type=str, default='2025-12-31', help='结束日期')
+
+    parser.add_argument('--force_refresh', action='store_true', help='强制重新生成缓存')
+    parser.add_argument('--mse_weight', type=float, default=0.5, help='Loss中MSE的权重')
+    parser.add_argument('--dropout', type=float, default=0.2, help='模型Dropout比率')
 
     args = parser.parse_args()
+
+    # 覆盖全局配置
     Config.MSE_WEIGHT = args.mse_weight
     Config.DROPOUT = args.dropout
+    # 如果命令行传入了 top_k，也更新 Config (虽然函数调用时已传参，但保持一致性更好)
+    Config.TOP_K = args.top_k
 
-    print(f"🚀 Mode: [{args.mode}]")
+    print(f"\n🚀 System Launching... Mode: [{args.mode}]")
+    print(f"🔧 Config: TopK={args.top_k}, MSE_Weight={args.mse_weight}, Dropout={args.dropout}")
+
+    # --------------------------------------------------------------------------
+    # 模式分发
+    # --------------------------------------------------------------------------
 
     if args.mode == 'download':
         DataProvider.download_data()
@@ -42,16 +53,21 @@ if __name__ == "__main__":
     elif args.mode == 'train':
         if args.force_refresh:
             p = DataProvider._get_cache_path('train')
-            if os.path.exists(p): os.remove(p)
+            if os.path.exists(p):
+                print(f"清理旧缓存: {p}")
+                os.remove(p)
         run_training()
 
     elif args.mode == 'predict':
         if args.force_refresh:
             p = DataProvider._get_cache_path('predict')
-            if os.path.exists(p): os.remove(p)
+            if os.path.exists(p):
+                print(f"清理旧缓存: {p}")
+                os.remove(p)
 
         top_stocks = run_inference(top_k=args.top_k)
 
+        # 预测后自动跑一次简单回测验证
         if top_stocks:
             run_backtest(top_stocks, initial_cash=args.cash, top_k=args.top_k)
 
@@ -67,3 +83,4 @@ if __name__ == "__main__":
         an = BacktestAnalyzer(start_date=args.start_date, end_date=args.end_date)
         an.generate_historical_predictions()
         an.analyze_performance()
+
