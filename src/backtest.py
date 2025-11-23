@@ -16,7 +16,7 @@ plt.rcParams['axes.unicode_minus'] = False
 
 
 # ==============================================================================
-#  1. 费率模型
+#  1. 交易环境模型 (费率 + 滑点)
 # ==============================================================================
 class AShareCommission(bt.CommInfoBase):
     """A股费率：佣金万三，印花税万五(卖出)，最低5元"""
@@ -33,13 +33,34 @@ class AShareCommission(bt.CommInfoBase):
         return 0.0
 
 
+class StockSlippage(bt.SlippageBase):
+    """
+    【新增】模拟冲击成本
+    固定百分比滑点：无论买卖，成交价都会向不利方向偏移
+    """
+    params = (('perc', Config.SLIPPAGE),)
+
+    def _calculate(self, order, price, parent=None):
+        if order.isbuy():
+            return price * (1 + self.p.perc)
+        elif order.issell():
+            return price * (1 - self.p.perc)
+        return price
+
+
 # ==============================================================================
-#  2. 核心策略：信号驱动型
+#  2. 核心策略：信号驱动型 (Walk-Forward)
 # ==============================================================================
 class ModelDrivenStrategy(bt.Strategy):
-    """【Walk-Forward 专用策略】"""
+    """
+    【Walk-Forward 专用策略 - 增强版】
+    包含：
+    1. 动态止盈/止损 (优胜劣汰)
+    2. 严格的涨跌停风控 (区分 10% 和 20%)
+    3. 流动性限制
+    """
     params = (
-        ('signals', None),  # 信号矩阵
+        ('signals', None),  # 信号矩阵 (DataFrame)
         ('top_k', Config.TOP_K),
         ('hold_days', Config.PRED_LEN),
         ('min_volume_percent', Config.MIN_VOLUME_PERCENT),
@@ -49,26 +70,75 @@ class ModelDrivenStrategy(bt.Strategy):
         self.hold_time = {}
         self.signal_dict = {}
         if self.p.signals is not None:
+            # 预处理每日 TopK，加速查找
             for date, row in self.p.signals.iterrows():
                 valid_row = row[row > -1]
                 if not valid_row.empty:
                     top_codes = valid_row.nlargest(self.p.top_k).index.tolist()
                     self.signal_dict[date.date()] = top_codes
 
+    def get_limit_threshold(self, code):
+        """获取该股票的涨跌停幅度 (20% 或 10%)"""
+        if code.startswith('688') or code.startswith('300'):
+            return 0.20
+        else:
+            return 0.10
+
+    def check_limit_status(self, data, code):
+        """
+        检查今日(T)是否涨跌停
+        返回: (is_limit_up, is_limit_down)
+        """
+        try:
+            prev_close = data.close[-1]
+            curr_close = data.close[0]
+            curr_high = data.high[0]
+            curr_low = data.low[0]
+
+            if prev_close == 0: return False, False
+
+            limit = self.get_limit_threshold(code)
+
+            # 判定涨停：收盘价涨幅接近 limit 且 收盘价等于最高价 (封板)
+            is_limit_up = (curr_close >= prev_close * (1 + limit - 0.005)) and (curr_close == curr_high)
+
+            # 判定跌停
+            is_limit_down = (curr_close <= prev_close * (1 - limit + 0.005)) and (curr_close == curr_low)
+
+            return is_limit_up, is_limit_down
+        except:
+            return False, False
+
     def next(self):
         current_date = self.data.datetime.date(0)
+        target_codes = self.signal_dict.get(current_date, [])
 
-        # 1. 卖出
+        # --- 1. 动态持仓管理 (卖出) ---
         for data in self.datas:
             if self.getposition(data).size > 0:
-                name = data._name
+                name = data._name  # stock code
+
+                # A. 涨跌停检查 (如果跌停，无法卖出，跳过)
+                is_limit_up, is_limit_down = self.check_limit_status(data, name)
+                if is_limit_down:
+                    continue
+
+                    # B. 动态优胜劣汰
+                # 规则：如果该股票不再属于今日的 Top K，则清仓
+                should_sell = False
+
+                if name not in target_codes:
+                    should_sell = True
+
                 self.hold_time[name] = self.hold_time.get(name, 0) + 1
                 if self.hold_time[name] >= self.p.hold_days:
+                    should_sell = True
+
+                if should_sell:
                     self.close(data=data)
                     self.hold_time[name] = 0
 
-        # 2. 买入
-        target_codes = self.signal_dict.get(current_date, [])
+        # --- 2. 信号开仓 (买入) ---
         if not target_codes: return
 
         cash = self.broker.get_cash()
@@ -87,26 +157,29 @@ class ModelDrivenStrategy(bt.Strategy):
             data = self.getdatabyname(code)
             if data is None: continue
 
-            if self.getposition(data).size == 0:
-                price = data.close[0]
-                vol = data.volume[0]
+            if self.getposition(data).size > 0: continue
 
-                if price <= 0 or vol <= 0: continue
+            # A. 涨跌停风控 (如果今日涨停，明日大概率买不进，跳过)
+            is_limit_up, is_limit_down = self.check_limit_status(data, code)
+            if is_limit_up:
+                continue
 
-                size = int(target_val / price / 100) * 100
+            price = data.close[0]
+            vol = data.volume[0]
 
-                if size < 100: continue
+            if price <= 0 or vol <= 0: continue
 
-                # 【修复】风控: 流动性限制
-                # 之前代码错误地除以 100 (min_volume_percent 0.02 变成了 0.0002)
-                # 正确逻辑: vol * 0.02
-                limit_size = int(vol * self.p.min_volume_percent) // 100 * 100
-                if size > limit_size: size = limit_size
+            size = int(target_val / price / 100) * 100
+            if size < 100: continue
 
-                if size >= 100:
-                    self.buy(data=data, size=size)
-                    self.hold_time[code] = 0
-                    buy_count += 1
+            # B. 流动性限制
+            limit_size = int(vol * self.p.min_volume_percent) // 100 * 100
+            if size > limit_size: size = limit_size
+
+            if size >= 100:
+                self.buy(data=data, size=size)
+                self.hold_time[code] = 0
+                buy_count += 1
 
 
 # ==============================================================================
@@ -170,7 +243,7 @@ class WalkForwardBacktester:
         print("正在重构信号矩阵...")
         res_df = pd.DataFrame(results, columns=['date', 'code', 'score'])
 
-        # 回测风控
+        # 回测风控 (Filter Bear Days and Low Scores)
         daily_mean = res_df.groupby('date')['score'].mean()
         bear_days = daily_mean[daily_mean < 0.45].index
         res_df.loc[res_df['date'].isin(bear_days), 'score'] = -1
@@ -205,6 +278,8 @@ class WalkForwardBacktester:
         cerebro = bt.Cerebro()
         cerebro.broker.setcash(self.initial_cash)
         cerebro.broker.addcommissioninfo(AShareCommission())
+        # 【新增】滑点注入
+        cerebro.broker.add_slippage_perc(StockSlippage, perc=Config.SLIPPAGE)
 
         print("正在加载回测行情数据...")
         loaded_cnt = 0
@@ -267,12 +342,12 @@ class WalkForwardBacktester:
             bench_cum = (1 + bench_ret).cumprod()
 
             plt.figure(figsize=(12, 6))
-            plt.plot(cumulative.index, cumulative, label='Strategy', color='red')
+            plt.plot(cumulative.index, cumulative, label='Strategy (Net)', color='red')
             plt.plot(bench_cum.index, bench_cum, label='CSI 300', color='gray', linestyle='--')
         except:
-            cumulative.plot(figsize=(12, 6), label='Strategy')
+            cumulative.plot(figsize=(12, 6), label='Strategy (Net)')
 
-        plt.title('Walk-Forward Equity Curve')
+        plt.title('Walk-Forward Equity Curve (w/ Slippage & Fees)')
         plt.legend()
         plt.grid(True)
         plt.savefig(os.path.join(Config.OUTPUT_DIR, "walk_forward_result.png"))
@@ -284,11 +359,12 @@ def run_walk_forward_backtest(start_date, end_date, initial_cash, top_k=Config.T
     engine.run(top_k=top_k)
 
 
-# --- 简单的 TopKStrategy (用于 predict 后的验证性回测) ---
+# --- TopKStrategy & PerformanceAnalyzer (用于 predict 后的验证性回测) ---
+
 class TopKStrategy(bt.Strategy):
     """
     【修复】TopK 验证策略
-    修复了流动性计算错误，并增加了每日 TopK 校验（如果是每日换仓模式）
+    用于 predict 模式后的简单验证，不含信号轮动，但包含风控
     """
     params = (
         ('top_k', Config.TOP_K),
@@ -326,10 +402,13 @@ class TopKStrategy(bt.Strategy):
                 vol = data.volume[0]
                 if price <= 0 or vol <= 0: continue
 
+                # 简单涨停不买
+                prev = data.close[-1]
+                if prev > 0 and data.close[0] >= prev * 1.095: continue
+
                 size = int(target / price / 100) * 100
                 if size < 100: continue
 
-                # 【修复】风控: 移除错误的除以 100
                 limit_size = int(vol * self.p.min_volume_percent) // 100 * 100
                 if size > limit_size: size = limit_size
 
@@ -339,7 +418,6 @@ class TopKStrategy(bt.Strategy):
                     buy_cnt += 1
 
 
-# ... [PerformanceAnalyzer 保持不变] ...
 class PerformanceAnalyzer:
     @staticmethod
     def get_benchmark(start_date, end_date):
@@ -382,10 +460,15 @@ class PerformanceAnalyzer:
 def run_single_backtest(codes, with_fees=True, initial_cash=1000000.0, top_k=Config.TOP_K):
     cerebro = bt.Cerebro();
     cerebro.broker.setcash(initial_cash)
+
+    # 配置费率
     if with_fees:
         cerebro.broker.addcommissioninfo(AShareCommission())
+        # 【新增】加入滑点 (如果是含费模式，通常也意味着要含滑点)
+        cerebro.broker.add_slippage_perc(StockSlippage, perc=Config.SLIPPAGE)
     else:
         cerebro.broker.setcommission(commission=0.0)
+
     loaded = False
     for code in codes:
         fpath = os.path.join(Config.DATA_DIR, f"{code}.parquet")
@@ -420,18 +503,30 @@ def run_single_backtest(codes, with_fees=True, initial_cash=1000000.0, top_k=Con
 
 
 def run_backtest(top_stocks_list, initial_cash=1000000.0, top_k=Config.TOP_K):
+    """
+    【恢复】完整的验证性回测入口
+    """
     print(f"\n>>> 启动验证性回测 (资金: {initial_cash:,.0f}, TopK: {top_k})")
     codes = [x[0] for x in top_stocks_list[:top_k]]
-    if not codes: return
+    if not codes:
+        print("❌ 股票列表为空，跳过回测。")
+        return
+
+    print("对比回测中: 含费+滑点 vs 无摩擦成本...")
     res_fees = run_single_backtest(codes, True, initial_cash, top_k)
     res_no = run_single_backtest(codes, False, initial_cash, top_k)
-    if not res_fees: return
-    print(f"{'指标':<15} | {'含费':<15} | {'无费':<15}")
+
+    if not res_fees:
+        print("❌ 回测失败 (可能无行情数据)")
+        return
+
+    print(f"{'指标':<15} | {'含费+滑点':<15} | {'理想情况':<15}")
     print("-" * 50)
     print(f"{'最终市值':<15} | {res_fees['final_value']:<15,.2f} | {res_no['final_value']:<15,.2f}")
     print(f"{'收益率':<15} | {res_fees['profit_rate']:<15.2%} | {res_no['profit_rate']:<15.2%}")
     print(f"{'胜率':<15} | {res_fees['win_rate']:<15.2%} | {res_no['win_rate']:<15.2%}")
     print("=" * 50)
+
     bench = PerformanceAnalyzer.get_benchmark(res_fees['start_date'], res_fees['end_date'])
     if bench is not None:
         m = PerformanceAnalyzer.calculate_metrics(res_fees['returns'], bench)

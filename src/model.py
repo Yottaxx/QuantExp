@@ -25,7 +25,7 @@ class HybridLoss(nn.Module):
         pred = pred.flatten()
         target = target.flatten()
 
-        # 异常保护
+        # 异常保护：防止单样本或常数输出导致 NaN
         if pred.numel() < 2 or pred.std() == 0 or target.std() == 0:
             return self.mse_loss(pred, target)
 
@@ -51,18 +51,20 @@ class PatchTSTForStock(PatchTSTPreTrainedModel):
         super().__init__(config)
         self.model = PatchTSTModel(config)
 
+        # 计算 Patch 数量
         num_patches = (config.context_length - config.patch_length) // config.stride + 1
 
+        # 增强 Head：增加一层 MLP 以提升非线性表达能力
         self.head = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(config.d_model * config.num_input_channels * num_patches, 256),
+            nn.Linear(config.d_model * config.num_input_channels * num_patches, 512),
+            nn.BatchNorm1d(512),  # BN 加速收敛
             nn.GELU(),
             nn.Dropout(config.dropout),
-            nn.Linear(256, 1)
+            nn.Linear(512, 1)
         )
 
-        # 【核心修改】从 config 中读取 mse_weight
-        # getattr 用于兼容性保护，防止旧 config 报错
+        # 兼容性读取
         weight = getattr(config, 'mse_weight', 0.5)
         self.loss_fct = HybridLoss(mse_weight=weight)
 
@@ -70,6 +72,8 @@ class PatchTSTForStock(PatchTSTPreTrainedModel):
 
     def forward(self, past_values, labels=None, **kwargs):
         outputs = self.model(past_values=past_values)
+
+        # 确保 Hidden State 维度正确 [Batch, Patches, D_Model]
         logits = self.head(outputs.last_hidden_state)
 
         loss = None
