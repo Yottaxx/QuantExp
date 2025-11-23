@@ -1,7 +1,11 @@
-import pandas as pd
 import os
 import glob
 import random
+
+import pytest
+
+pytest.importorskip("pandas")
+import pandas as pd
 
 # 数据存储目录 (根据之前的配置)
 DATA_DIR = "./data/stock_lake"

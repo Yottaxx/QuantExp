@@ -1,3 +1,8 @@
+import pytest
+
+pytest.importorskip("pandas")
+pytest.importorskip("numpy")
+
 import pandas as pd
 import numpy as np
 
