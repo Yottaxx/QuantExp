@@ -10,16 +10,14 @@ from .config import Config
 from .model import PatchTSTForStock
 from .data_provider import DataProvider
 
-# 设置 Matplotlib 中文字体
 plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 
 # ==============================================================================
-#  1. 交易环境模型 (费率 + 滑点)
+#  1. 交易环境模型
 # ==============================================================================
 class AShareCommission(bt.CommInfoBase):
-    """A股费率：佣金万三，印花税万五(卖出)，最低5元"""
     params = (('stocklike', True), ('commtype', bt.CommInfoBase.COMM_PERC),
               ('perc', 0.0003), ('stamp_duty', 0.0005), ('min_comm', 5.0))
 
@@ -34,10 +32,7 @@ class AShareCommission(bt.CommInfoBase):
 
 
 class StockSlippage(bt.SlippageBase):
-    """
-    【新增】模拟冲击成本
-    固定百分比滑点：无论买卖，成交价都会向不利方向偏移
-    """
+    """冲击成本模拟"""
     params = (('perc', Config.SLIPPAGE),)
 
     def _calculate(self, order, price, parent=None):
@@ -49,18 +44,17 @@ class StockSlippage(bt.SlippageBase):
 
 
 # ==============================================================================
-#  2. 核心策略：信号驱动型 (Walk-Forward)
+#  2. 核心策略
 # ==============================================================================
 class ModelDrivenStrategy(bt.Strategy):
     """
-    【Walk-Forward 专用策略 - 增强版】
-    包含：
-    1. 动态止盈/止损 (优胜劣汰)
-    2. 严格的涨跌停风控 (区分 10% 和 20%)
-    3. 流动性限制
+    【Production Strategy】
+    1. 动态优胜劣汰 (Rank Based Exit)
+    2. 板块特异性风控 (科创/创业 20%)
+    3. 严格流动性限制
     """
     params = (
-        ('signals', None),  # 信号矩阵 (DataFrame)
+        ('signals', None),
         ('top_k', Config.TOP_K),
         ('hold_days', Config.PRED_LEN),
         ('min_volume_percent', Config.MIN_VOLUME_PERCENT),
@@ -70,7 +64,6 @@ class ModelDrivenStrategy(bt.Strategy):
         self.hold_time = {}
         self.signal_dict = {}
         if self.p.signals is not None:
-            # 预处理每日 TopK，加速查找
             for date, row in self.p.signals.iterrows():
                 valid_row = row[row > -1]
                 if not valid_row.empty:
@@ -78,33 +71,22 @@ class ModelDrivenStrategy(bt.Strategy):
                     self.signal_dict[date.date()] = top_codes
 
     def get_limit_threshold(self, code):
-        """获取该股票的涨跌停幅度 (20% 或 10%)"""
-        if code.startswith('688') or code.startswith('300'):
-            return 0.20
-        else:
-            return 0.10
+        """区分板块涨跌停幅度"""
+        if code.startswith('688') or code.startswith('300'): return 0.20
+        return 0.10
 
     def check_limit_status(self, data, code):
-        """
-        检查今日(T)是否涨跌停
-        返回: (is_limit_up, is_limit_down)
-        """
+        """检测 T 日是否涨跌停"""
         try:
             prev_close = data.close[-1]
             curr_close = data.close[0]
             curr_high = data.high[0]
             curr_low = data.low[0]
-
             if prev_close == 0: return False, False
 
             limit = self.get_limit_threshold(code)
-
-            # 判定涨停：收盘价涨幅接近 limit 且 收盘价等于最高价 (封板)
             is_limit_up = (curr_close >= prev_close * (1 + limit - 0.005)) and (curr_close == curr_high)
-
-            # 判定跌停
             is_limit_down = (curr_close <= prev_close * (1 - limit + 0.005)) and (curr_close == curr_low)
-
             return is_limit_up, is_limit_down
         except:
             return False, False
@@ -113,66 +95,51 @@ class ModelDrivenStrategy(bt.Strategy):
         current_date = self.data.datetime.date(0)
         target_codes = self.signal_dict.get(current_date, [])
 
-        # --- 1. 动态持仓管理 (卖出) ---
+        # --- Sell Logic ---
         for data in self.datas:
             if self.getposition(data).size > 0:
-                name = data._name  # stock code
-
-                # A. 涨跌停检查 (如果跌停，无法卖出，跳过)
+                name = data._name
                 is_limit_up, is_limit_down = self.check_limit_status(data, name)
-                if is_limit_down:
-                    continue
+                if is_limit_down: continue
 
-                    # B. 动态优胜劣汰
-                # 规则：如果该股票不再属于今日的 Top K，则清仓
                 should_sell = False
-
-                if name not in target_codes:
-                    should_sell = True
+                if name not in target_codes: should_sell = True
 
                 self.hold_time[name] = self.hold_time.get(name, 0) + 1
-                if self.hold_time[name] >= self.p.hold_days:
-                    should_sell = True
+                if self.hold_time[name] >= self.p.hold_days: should_sell = True
 
                 if should_sell:
                     self.close(data=data)
                     self.hold_time[name] = 0
 
-        # --- 2. 信号开仓 (买入) ---
+        # --- Buy Logic ---
         if not target_codes: return
-
         cash = self.broker.get_cash()
         if cash < 5000: return
 
         current_pos = len([d for d in self.datas if self.getposition(d).size > 0])
         slots_available = self.p.top_k - current_pos
         if slots_available <= 0: return
-
         target_val = cash / slots_available * 0.98
 
         buy_count = 0
         for code in target_codes:
             if buy_count >= slots_available: break
-
             data = self.getdatabyname(code)
             if data is None: continue
-
             if self.getposition(data).size > 0: continue
 
-            # A. 涨跌停风控 (如果今日涨停，明日大概率买不进，跳过)
             is_limit_up, is_limit_down = self.check_limit_status(data, code)
-            if is_limit_up:
-                continue
+            if is_limit_up: continue
 
             price = data.close[0]
             vol = data.volume[0]
-
             if price <= 0 or vol <= 0: continue
 
             size = int(target_val / price / 100) * 100
             if size < 100: continue
 
-            # B. 流动性限制
+            # 流动性风控 (Fixed)
             limit_size = int(vol * self.p.min_volume_percent) // 100 * 100
             if size > limit_size: size = limit_size
 
@@ -183,7 +150,7 @@ class ModelDrivenStrategy(bt.Strategy):
 
 
 # ==============================================================================
-#  3. 滚动回测引擎
+#  3. 滚动回测引擎 (Walk-Forward)
 # ==============================================================================
 class WalkForwardBacktester:
     def __init__(self, start_date, end_date, initial_cash=1000000.0):
@@ -243,7 +210,7 @@ class WalkForwardBacktester:
         print("正在重构信号矩阵...")
         res_df = pd.DataFrame(results, columns=['date', 'code', 'score'])
 
-        # 回测风控 (Filter Bear Days and Low Scores)
+        # 回测风控
         daily_mean = res_df.groupby('date')['score'].mean()
         bear_days = daily_mean[daily_mean < 0.45].index
         res_df.loc[res_df['date'].isin(bear_days), 'score'] = -1
@@ -278,7 +245,6 @@ class WalkForwardBacktester:
         cerebro = bt.Cerebro()
         cerebro.broker.setcash(self.initial_cash)
         cerebro.broker.addcommissioninfo(AShareCommission())
-        # 【新增】滑点注入
         cerebro.broker.add_slippage_perc(StockSlippage, perc=Config.SLIPPAGE)
 
         print("正在加载回测行情数据...")
@@ -357,7 +323,6 @@ class WalkForwardBacktester:
 def run_walk_forward_backtest(start_date, end_date, initial_cash, top_k=Config.TOP_K):
     engine = WalkForwardBacktester(start_date, end_date, initial_cash)
     engine.run(top_k=top_k)
-
 
 # --- TopKStrategy & PerformanceAnalyzer (用于 predict 后的验证性回测) ---
 

@@ -4,10 +4,10 @@ import os
 
 class Config:
     """
-    【全局配置中心 - Production Ready】
+    【全局配置中心 - Production Grade】
     管理所有超参数、路径配置、网络设置和常量。
     """
-    # --- 基础路径 (使用绝对路径避免引用错误) ---
+    # --- 基础路径 (使用绝对路径确保稳定) ---
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DATA_DIR = os.path.join(BASE_DIR, "data", "stock_lake")
     OUTPUT_DIR = os.path.join(BASE_DIR, "output", "checkpoints")
@@ -16,12 +16,12 @@ class Config:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # --- 数据参数 ---
-    START_DATE = "20100101"  # 扩大数据范围以涵盖更多周期
+    START_DATE = "20100101"  # 扩大训练窗口覆盖牛熊周期
 
     # --- 网络与代理配置 ---
     PROXY_URL = "http://127.0.0.1:7890"
     CLASH_API_URL = "http://127.0.0.1:49812"
-    CLASH_SECRET = "b342ba26-2ae3-47bb-a057-6624e171d5c6"
+    CLASH_SECRET = ""
 
     # --- 市场符号配置 ---
     BENCHMARK_SYMBOL = "sh000300"  # 沪深300
@@ -33,22 +33,19 @@ class Config:
         'cs_rank_', 'mkt_', 'rel_', 'time_'
     ]
 
-    # --- 模型参数 (针对 PatchTST 优化) ---
-    # 增加上下文长度，以便 Transformer 捕捉中期趋势
-    CONTEXT_LEN = 64
-    PRED_LEN = 5
+    # --- 模型参数 (PatchTST) ---
+    CONTEXT_LEN = 64  # 增加上下文长度以捕捉中期趋势
+    PRED_LEN = 5  # 预测未来5日收益
     PATCH_LEN = 8
     STRIDE = 4
     DROPOUT = 0.2
 
     # --- 训练参数 ---
-    BATCH_SIZE = 128  # 适当增大 Batch
-    EPOCHS = 15
+    BATCH_SIZE = 128
+    EPOCHS = 20  # 增加轮数，依赖 EarlyStopping 控制
     LR = 1e-4
-    MSE_WEIGHT = 0.5
-
-    # 增加梯度裁剪，防止梯度爆炸
-    MAX_GRAD_NORM = 1.0
+    MSE_WEIGHT = 0.5  # IC Loss 与 MSE 的平衡权重
+    MAX_GRAD_NORM = 1.0  # 梯度裁剪阈值
 
     # --- 推理与分析参数 ---
     INFERENCE_BATCH_SIZE = 256
@@ -59,9 +56,7 @@ class Config:
     # --- 交易风控参数 ---
     MIN_VOLUME_PERCENT = 0.02  # 2% 流动性上限
     RISK_FREE_RATE = 0.02
-
-    # 【新增】滑点设置 (双边万分之二，模拟冲击成本)
-    SLIPPAGE = 0.002
+    SLIPPAGE = 0.002  # 双边万分之二滑点，模拟冲击成本
 
     # --- 硬件 ---
     DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"

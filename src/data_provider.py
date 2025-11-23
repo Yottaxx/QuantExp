@@ -25,7 +25,7 @@ class DataProvider:
     _last_switch_time = 0
 
     # --------------------------------------------------------------------------
-    # PART 1: 基础设施 (保持稳健)
+    # PART 1: 基础设施
     # --------------------------------------------------------------------------
     @staticmethod
     def _setup_proxy_env():
@@ -80,7 +80,7 @@ class DataProvider:
 
         if os.path.exists(path):
             mtime = os.path.getmtime(path)
-            if (time.time() - mtime) < 3 * 24 * 3600: return code, True, "Skipped"  # 3天更新一次
+            if (time.time() - mtime) < 3 * 24 * 3600: return code, True, "Skipped"
 
         for attempt in range(3):
             try:
@@ -103,7 +103,6 @@ class DataProvider:
                 else:
                     df['pub_date'] = pd.NaT
 
-                # 数值转换
                 for c in df.columns:
                     if c not in ['date', 'pub_date']:
                         df[c] = pd.to_numeric(df[c], errors='coerce').astype(np.float32)
@@ -153,7 +152,6 @@ class DataProvider:
                         if multiplier > 50:
                             df['volume'] = df['volume'] * 100
 
-                # 删除 amount 以节省内存 (或保留用于更高级回测)
                 if 'amount' in df.columns:
                     df.drop(columns=['amount'], inplace=True)
 
@@ -180,7 +178,6 @@ class DataProvider:
 
         try:
             # 注意：此处存在幸存者偏差风险，akshare 仅返回当前上市股票
-            # 生产环境应接入 Paid Data Source 获取 Delisted Stocks
             stock_info = ak.stock_zh_a_spot_em()
             codes = stock_info['代码'].tolist()
         except:
@@ -203,14 +200,12 @@ class DataProvider:
 
         print(f"📊 股票池总数: {len(codes)} | 待更新: {len(todo_price)}")
 
-        # 并发下载行情
         if todo_price:
             with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
                 futures = {executor.submit(DataProvider._download_worker, c): c for c in todo_price}
                 for _ in tqdm(concurrent.futures.as_completed(futures), total=len(todo_price),
                               desc="Downloading Price"): pass
 
-        # 并发下载财务
         print("正在同步财务数据...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(DataProvider._download_finance_worker, c): c for c in codes}
@@ -224,27 +219,31 @@ class DataProvider:
         return os.path.join(Config.OUTPUT_DIR, f"panel_cache_{mode}_{today_str}.pkl")
 
     @staticmethod
-    def _filter_universe(panel_df):
-        """动态股票池过滤 (Volume > 0, Price > 2, Listed > 60d)"""
-        print(">>> [Filtering] 执行 Universe 过滤...")
-        original_len = len(panel_df)
+    def _tag_universe(panel_df):
+        """
+        【逻辑修正】标记 Universe 而非直接删除行
+        防止删除行后导致的时间序列断裂 (Time-Series Discontinuity)
+        """
+        print(">>> [Tagging] 标记动态股票池 (Universe Mask)...")
 
-        # 基础清洗
-        panel_df = panel_df[panel_df['volume'] > 0]
-        panel_df = panel_df[panel_df['close'] >= 2.0]
+        # 基础条件
+        cond_vol = panel_df['volume'] > 0
+        cond_price = panel_df['close'] >= 2.0  # 剔除 penny stocks
 
-        # 上市时间过滤
-        panel_df['list_days'] = panel_df.groupby('code').cumcount()
-        panel_df = panel_df[panel_df['list_days'] > 60]
-        panel_df = panel_df.drop(columns=['list_days'])
+        # 上市时间 > 60天
+        list_days = panel_df.groupby('code')['date'].transform('count')
+        cond_list = list_days > 60
 
-        new_len = len(panel_df)
-        print(f"过滤统计: {original_len} -> {new_len} (剔除率: {1 - new_len / original_len:.2%})")
+        # 综合标记
+        panel_df['is_universe'] = cond_vol & cond_price & cond_list
+
+        valid_count = panel_df['is_universe'].sum()
+        total_count = len(panel_df)
+        print(f"Universe 覆盖率: {valid_count}/{total_count} ({valid_count / total_count:.2%})")
         return panel_df
 
     @staticmethod
     def load_and_process_panel(mode='train', force_refresh=False):
-        """构建全市场 Panel 数据 (核心函数)"""
         cache_path = DataProvider._get_cache_path(mode)
         if not force_refresh and os.path.exists(cache_path):
             print(f"⚡️ [Cache Hit] {cache_path}")
@@ -259,10 +258,9 @@ class DataProvider:
         def _read_price(f):
             try:
                 df = pd.read_parquet(f)
-                code = os.path.basename(f).replace(".parquet", "")
+                df['code'] = os.path.basename(f).replace(".parquet", "")
                 float_cols = df.select_dtypes(include=['float64']).columns
                 df[float_cols] = df[float_cols].astype(np.float32)
-                df['code'] = code
                 return df
             except:
                 return None
@@ -275,6 +273,7 @@ class DataProvider:
         panel_df = pd.concat(data_frames, ignore_index=False)
         del data_frames
         panel_df['code'] = panel_df['code'].astype(str)
+        panel_df['date'] = pd.to_datetime(panel_df['date'])
 
         # 2. 读取并合并财务数据 (PIT - Point In Time 处理)
         fund_files = glob.glob(os.path.join(fund_dir, "*.parquet"))
@@ -307,61 +306,47 @@ class DataProvider:
                 delays = report_months.apply(lambda m: 120 if m == 12 else 60)
                 fund_df.loc[mask_na, 'merge_date'] = fund_df.loc[mask_na, 'date'] + pd.to_timedelta(delays, unit='D')
             else:
-                # 悲观假设：全部延后 90 天 (介于 60-120 之间)
                 fund_df['merge_date'] = fund_df['date'] + pd.Timedelta(days=90)
 
-            # 清理
             fund_df = fund_df.drop(columns=['date', 'pub_date'], errors='ignore')
             fund_df.rename(columns={'merge_date': 'date'}, inplace=True)
 
             panel_df = panel_df.reset_index().sort_values(['code', 'date'])
             panel_df = pd.merge_asof(panel_df, fund_df, on='date', by='code', direction='backward')
 
-            # 缺失值填充
             for c in ['roe', 'rev_growth', 'profit_growth', 'debt_ratio', 'pe_ttm', 'pb']:
                 if c in panel_df.columns: panel_df[c] = panel_df[c].fillna(0).astype(np.float32)
             print("✅ 财务数据 PIT 对齐完成。")
 
-        # 3. 计算 Alpha
         if 'date' in panel_df.columns: panel_df = panel_df.set_index('date')
         panel_df = panel_df.reset_index().sort_values(['code', 'date'])
 
         print("计算时序因子...")
-        # 使用 GroupBy Apply 计算时序特征
+        # 必须在 Universe 过滤前计算，保证时序连续性
         panel_df = panel_df.groupby('code', group_keys=False).apply(lambda x: AlphaFactory(x).make_factors())
 
-        # 4. 构造 Label (预测未来收益)
         print("构造预测目标 (Labels)...")
         panel_df['next_open'] = panel_df.groupby('code')['open'].shift(-1)
         panel_df['future_close'] = panel_df.groupby('code')['close'].shift(-Config.PRED_LEN)
-        # Target: T+1 Open 到 T+N Close 的收益 (模拟实盘 T+1 买入)
         panel_df['target'] = panel_df['future_close'] / panel_df['next_open'] - 1
         panel_df.drop(columns=['next_open', 'future_close'], inplace=True)
 
-        # 5. 切分数据
         if mode == 'train':
             panel_df.dropna(subset=['target'], inplace=True)
-        else:
-            # 预测模式下保留最后一行用于推理
-            pass
 
-        # 6. 过滤 Universe
-        panel_df = DataProvider._filter_universe(panel_df)
+        # --- 标记 Universe (不删除行) ---
+        panel_df = DataProvider._tag_universe(panel_df)
 
-        # 7. 截面处理 (SVD/Rank)
         print("计算截面因子与标准化...")
         panel_df = panel_df.set_index('date')
         panel_df = AlphaFactory.add_cross_sectional_factors(panel_df)
 
-        # 提取特征列
         feature_cols = [c for c in panel_df.columns
                         if any(c.startswith(p) for p in Config.FEATURE_PREFIXES)]
 
-        # 最终清洗
         panel_df[feature_cols] = panel_df[feature_cols].fillna(0).replace([np.inf, -np.inf], 0).astype(np.float32)
         panel_df = panel_df.reset_index()
 
-        # 缓存
         with open(cache_path, 'wb') as f:
             pickle.dump((panel_df, feature_cols), f)
 
@@ -369,69 +354,75 @@ class DataProvider:
 
     @staticmethod
     def make_dataset(panel_df, feature_cols):
-        """构造 PyTorch Dataset"""
+        """
+        构造 Dataset
+        【关键修复】
+        1. 仅选择 is_universe=True 的点作为切片终点
+        2. 确保切片内的时间连续性
+        3. Train/Test 之间增加 Purging Gap
+        """
         print(">>> [Dataset] 转换张量格式...")
-        panel_df = panel_df.sort_values(['code', 'date'])
+        panel_df = panel_df.sort_values(['code', 'date']).reset_index(drop=True)
+
         feature_matrix = panel_df[feature_cols].values.astype(np.float32)
-
-        # 确定 Label
         if 'rank_label' in panel_df.columns:
-            target_col = 'rank_label'
-            fill_val = 0.5
-        elif 'excess_label' in panel_df.columns:
-            target_col = 'excess_label'
-            fill_val = 0.0
+            target_array = panel_df['rank_label'].fillna(0.5).values.astype(np.float32)
         else:
-            target_col = 'target'
-            fill_val = 0.0
+            target_array = panel_df['target'].fillna(0).values.astype(np.float32)
 
-        target_array = panel_df[target_col].fillna(fill_val).values.astype(np.float32)
-        dates = panel_df['date'].values  # 保留日期用于 split
-
-        # 生成有效索引
+        universe_mask = panel_df['is_universe'].values
+        dates = panel_df['date'].values
         codes = panel_df['code'].values
+
         code_changes = np.where(codes[:-1] != codes[1:])[0] + 1
         start_indices = np.concatenate(([0], code_changes))
         end_indices = np.concatenate((code_changes, [len(codes)]))
 
         valid_indices = []
         seq_len = Config.CONTEXT_LEN
-        stride = Config.STRIDE  # 使用 Config 中的 Stride
+        stride = Config.STRIDE
 
         for start, end in zip(start_indices, end_indices):
-            length = end - start
-            if length <= seq_len: continue
-            for i in range(start, end - seq_len + 1, stride): valid_indices.append(i)
+            if end - start <= seq_len: continue
+            for i in range(start + seq_len - 1, end, stride):
+                if universe_mask[i]:
+                    valid_indices.append(i - seq_len + 1)
 
-        # 按时间切分 Train/Valid
-        # 注意：这里增加了 Purging 逻辑，虽然简单，但确保了验证集在时间上严格晚于训练集
-        unique_dates = np.sort(panel_df['date'].unique())
+        valid_indices = np.array(valid_indices)
+
+        # --- 时间切分 (Purged K-Fold 思想) ---
+        unique_dates = np.sort(np.unique(dates))
         split_idx = int(len(unique_dates) * 0.9)
         split_date = unique_dates[split_idx]
 
-        sample_dates = dates[np.array(valid_indices) + seq_len - 1]
+        sample_pred_dates = dates[valid_indices + seq_len - 1]
 
-        # 严格的时间切分
-        train_mask = sample_dates < split_date
-        train_indices = np.array(valid_indices)[train_mask]
-        valid_indices = np.array(valid_indices)[~train_mask]
+        train_mask = sample_pred_dates < split_date
 
-        # 为了防止训练集末尾数据泄露到验证集，验证集应跳过 Context Length 长度
-        # (此处简化处理，因 Split Date 已经是截断的)
+        # Gap = Context Length (避免 Train 末尾的数据作为 Valid 开头的 Past Values)
+        gap_date = unique_dates[min(split_idx + Config.CONTEXT_LEN, len(unique_dates) - 1)]
+        test_mask = sample_pred_dates > gap_date
+
+        train_indices = valid_indices[train_mask]
+        test_indices = valid_indices[test_mask]
+
+        print(f"样本分割: Train={len(train_indices)}, Test={len(test_indices)} (Gap Removed)")
 
         def gen_train():
-            np.random.shuffle(train_indices)  # 训练集打乱
-            for idx in train_indices:
+            np.random.shuffle(train_indices)
+            for start_idx in train_indices:
+                end_idx = start_idx + seq_len
                 yield {
-                    "past_values": feature_matrix[idx: idx + seq_len],
-                    "labels": target_array[idx + seq_len - 1]
+                    "past_values": feature_matrix[start_idx: end_idx],
+                    "labels": target_array[end_idx - 1]
                 }
 
         def gen_valid():
-            for idx in valid_indices:
+            for start_idx in test_indices:
+                end_idx = start_idx + seq_len
                 yield {
-                    "past_values": feature_matrix[idx: idx + seq_len],
-                    "labels": target_array[idx + seq_len - 1]
+                    "past_values": feature_matrix[start_idx: end_idx],
+                    "labels": target_array[end_idx - 1]
                 }
 
         from datasets import DatasetDict
