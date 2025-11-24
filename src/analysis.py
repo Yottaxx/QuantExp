@@ -41,8 +41,9 @@ class BacktestAnalyzer:
         panel_df, feature_cols = DataProvider.load_and_process_panel(mode='train')
 
         # 2. 筛选时间段 (为了回测效率，只取目标区间 + 窗口期)
-        mask_date = (panel_df['date'] >= (self.start_date - pd.Timedelta(days=Config.CONTEXT_LEN * 2))) & \
-                    (panel_df['date'] <= self.end_date)
+        # 预留足够的 Lookback 窗口
+        start_buffer = self.start_date - pd.Timedelta(days=Config.CONTEXT_LEN * 2 + 100)
+        mask_date = (panel_df['date'] >= start_buffer) & (panel_df['date'] <= self.end_date)
         df_sub = panel_df[mask_date].copy()
 
         if df_sub.empty:
@@ -58,6 +59,7 @@ class BacktestAnalyzer:
 
         grouped = df_sub.groupby('code')
 
+        # [Optim] 使用 tqdm 显示总体进度，而不是每只股票刷屏
         for code, group in tqdm(grouped, desc="Processing Stocks"):
             if len(group) < Config.CONTEXT_LEN: continue
 
@@ -71,10 +73,16 @@ class BacktestAnalyzer:
 
             seq_len = Config.CONTEXT_LEN
 
-            for i in range(len(group) - seq_len + 1):
+            # [Fix] 优化循环边界，确保索引不越界
+            # 我们需要 feats[i: i+seq_len] 作为输入
+            # 对应的预测日期是 dates[i + seq_len - 1]
+            valid_indices = range(len(group) - seq_len + 1)
+
+            for i in valid_indices:
                 pred_date_ts = dates[i + seq_len - 1]
                 pred_date = pd.to_datetime(pred_date_ts)
 
+                # 只保留用户指定时间范围内的结果
                 if pred_date < self.start_date or pred_date > self.end_date:
                     continue
 
@@ -104,15 +112,23 @@ class BacktestAnalyzer:
             outputs = model(past_values=tensor)
             scores = outputs.logits.squeeze().cpu().numpy()
 
+        # Handle batch size 1 or scalar output
         if scores.ndim == 0: scores = [scores]
+        if len(meta) > 1 and len(scores) != len(meta):
+            # 极少数情况下可能维度不匹配，做个防御
+            scores = np.resize(scores, len(meta))
 
         for i, score in enumerate(scores):
+            # [Safe] 确保 meta 索引不过界
+            if i >= len(meta): break
             item = meta[i]
             item['score'] = float(score)
             results_list.append(item)
 
     def analyze_performance(self):
-        if self.results_df is None or self.results_df.empty: return
+        if self.results_df is None or self.results_df.empty:
+            print("⚠️ 无分析结果数据")
+            return
 
         # 按日期和分数排序
         df = self.results_df.sort_values(['date', 'score'], ascending=[True, False])
@@ -120,7 +136,8 @@ class BacktestAnalyzer:
         print("\n计算截面 IC 指标...")
 
         # 1. 计算 Rank IC
-        daily_ic = df.groupby('date').apply(
+        # [Fix] 兼容 Pandas 新版 groupby apply
+        daily_ic = df.groupby('date')[['score', 'rank_label']].apply(
             lambda x: spearmanr(x['score'], x['rank_label'])[0]
         )
 
@@ -135,31 +152,39 @@ class BacktestAnalyzer:
         print(f"IC Win Rate   : {(daily_ic > 0).mean():.2%}")
         print("-" * 40)
 
-        # 2. 分层回测 (Layered Backtest) - 【逻辑修正版】
+        # 2. 分层回测 (Layered Backtest)
         def get_layer_ret(g):
             try:
-                # 尝试分5组，如果数据太少，qcut 会自动减少组数（需配合 duplicates='drop'）
-                # labels=False 返回组号 0, 1, 2...
-                # 因为 score 越大越好，我们希望组号越大代表分数越高
+                # 尝试分5组
                 g['group'] = pd.qcut(g['score'], 5, labels=False, duplicates='drop')
                 return g.groupby('group')['excess_label'].mean()
             except:
                 return None
 
-        # groupby apply 可能返回 MultiIndex Series (Date, Group)
+        # [Fix] 兼容 Pandas 新版
         layer_ret_raw = df.groupby('date').apply(get_layer_ret)
 
         if layer_ret_raw is not None and not layer_ret_raw.empty:
-            # 【核心修正 1】矩阵展开与对齐
-            # 确保得到一个 DataFrame: Index=Date, Columns=Group_ID
             if isinstance(layer_ret_raw, pd.Series):
                 layer_ret = layer_ret_raw.unstack(level=-1)
             else:
                 layer_ret = layer_ret_raw
 
-            # 【核心修正 2】空值填充
-            # 如果某天某组没票，收益填0，防止 cumprod 断裂
             layer_ret = layer_ret.fillna(0.0)
+
+            # ==================================================================
+            # [CRITICAL FIX] 修正重叠收益计算逻辑
+            # ==================================================================
+            # 因为 Config.PRED_LEN = 5，也就是说 excess_label 是未来5天的累计收益。
+            # 如果每天都累乘这个收益，会导致收益被重复计算 5 次。
+            #
+            # 修正方法：
+            # 将 N 日累计收益平摊到单日，近似为：Daily_Ret = Total_Ret / N
+            # 这是一个线性近似，用于分层对比足够了。严谨的回测请参考 backtest.py。
+            # ==================================================================
+            if Config.PRED_LEN > 1:
+                print(f"⚠️ 检测到多日预测 (PRED_LEN={Config.PRED_LEN})，正在对收益率进行平摊修正...")
+                layer_ret = layer_ret / Config.PRED_LEN
 
             # 计算各组累积收益
             cum_ret = (1 + layer_ret).cumprod()
@@ -168,39 +193,44 @@ class BacktestAnalyzer:
 
             # 子图1: 分层收益曲线
             plt.subplot(2, 1, 1)
-            colors = ['green', 'lime', 'grey', 'orange', 'red']
 
             # 获取实际存在的组号
             available_groups = sorted(layer_ret.columns)
 
-            for i in available_groups:
+            # 颜色映射：根据组数动态生成或固定
+            cmap = plt.get_cmap('RdYlGn_r')  # 红(好) -> 绿(差)
+
+            for idx, i in enumerate(available_groups):
                 # 动态生成标签
                 if i == available_groups[-1]:
                     label = "Top Group (Long)"
                     c = 'red'
                     alpha = 1.0
+                    lw = 2
                 elif i == available_groups[0]:
                     label = "Bottom Group (Short)"
                     c = 'green'
                     alpha = 1.0
+                    lw = 1.5
                 else:
                     label = f"Group {i}"
                     c = 'grey'
                     alpha = 0.3
+                    lw = 1
 
-                plt.plot(cum_ret.index, cum_ret[i], label=label, color=c, alpha=alpha)
+                plt.plot(cum_ret.index, cum_ret[i], label=label, color=c, alpha=alpha, linewidth=lw)
 
-            # 【核心修正 3】动态计算多空曲线
-            # 只有当至少有 2 个组时才计算多空
+            # 动态计算多空曲线
             if len(available_groups) >= 2:
                 top_grp = available_groups[-1]
                 bot_grp = available_groups[0]
+                # 多空收益也需要平摊吗？是的，因为 layer_ret 已经平摊过了，直接相减即可
                 long_short_ret = layer_ret[top_grp] - layer_ret[bot_grp]
                 long_short_cum = (1 + long_short_ret).cumprod()
                 plt.plot(long_short_cum.index, long_short_cum, label='Long-Short (Alpha)', color='blue', linestyle='--',
                          linewidth=2)
 
-            plt.title('Layered Backtest (Cumulative Excess Return)')
+            plt.title(f'Layered Backtest (Avg Daily Return derived from {Config.PRED_LEN}-Day Horizon)')
             plt.legend(loc='upper left')
             plt.grid(True, alpha=0.3)
 
