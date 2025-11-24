@@ -23,7 +23,15 @@ def test_model_forward_and_loss():
     )
     model = PatchTSTForStock(config)
 
-    batch = torch.tensor(np.random.randn(4, config.num_input_channels, config.context_length), dtype=torch.float32)
+    # [Fix] Correct tensor dimension order.
+    # PatchTST typically expects (batch, sequence_length, num_channels)
+    # Previous: (4, 3, 5) -> interpreted as (Batch, SeqLen=3, Channels=5)
+    # Correct:  (4, 5, 3) -> interpreted as (Batch, SeqLen=5, Channels=3)
+    batch = torch.tensor(
+        np.random.randn(4, config.context_length, config.num_input_channels),
+        dtype=torch.float32
+    )
+
     labels = torch.tensor(np.random.randn(4, 1), dtype=torch.float32)
 
     out = model(past_values=batch, labels=labels)

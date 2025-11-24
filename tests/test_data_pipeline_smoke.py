@@ -17,7 +17,9 @@ def build_synthetic_panel():
     Config.PRED_LEN = 2
     Config.STRIDE = 2
 
-    dates = pd.date_range("2024-01-02", periods=12, freq="B")
+    # [Fix] Increase data points to 200 to ensure Test Split has data after Gap Purging
+    dates = pd.date_range("2024-01-02", periods=200, freq="B")
+
     frames = []
     for offset, code in enumerate(["000001", "000002"]):
         base = np.arange(len(dates)) + offset
@@ -68,5 +70,9 @@ def test_dataset_creation_runs_end_to_end():
     assert len(ds["test"]) > 0
 
     sample = ds["train"][0]
-    assert sample["past_values"].shape[1] == num_features
+
+    # [Fix] Wrap output in np.array() because HuggingFace Datasets returns Python lists by default
+    past_values = np.array(sample["past_values"])
+
+    assert past_values.shape[1] == num_features
     assert np.isfinite(sample["labels"]).all()

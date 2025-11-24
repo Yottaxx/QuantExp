@@ -83,4 +83,3 @@ if __name__ == "__main__":
         an = BacktestAnalyzer(start_date=args.start_date, end_date=args.end_date)
         an.generate_historical_predictions()
         an.analyze_performance()
-
