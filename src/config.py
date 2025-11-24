@@ -58,5 +58,10 @@ class Config:
     RISK_FREE_RATE = 0.02
     SLIPPAGE = 0.002  # 双边万分之二滑点，模拟冲击成本
 
+    # [Added] 资金缓冲系数
+    # 防止 T+1 开盘低开导致回款不足以覆盖 T 日预估买单金额
+    # 0.98 意味着只使用 98% 的可用资金进行开仓
+    CASH_BUFFER = 0.98
+
     # --- 硬件 ---
     DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"

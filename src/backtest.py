@@ -5,6 +5,7 @@ import os
 import torch
 import akshare as ak
 import matplotlib
+
 matplotlib.use('Agg')  # <--- 加上这一行，必须在 import matplotlib.pyplot 之前
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -36,6 +37,7 @@ class ModelDrivenStrategy(bt.Strategy):
         ('top_k', Config.TOP_K),
         ('hold_days', Config.PRED_LEN),
         ('min_volume_percent', Config.MIN_VOLUME_PERCENT),
+        ('cash_buffer', Config.CASH_BUFFER),  # [Updated] Add param
     )
 
     def __init__(self):
@@ -78,7 +80,7 @@ class ModelDrivenStrategy(bt.Strategy):
 
             is_limit_up = (curr_close >= prev_close * (1 + limit) - epsilon) and (abs(curr_close - curr_high) < epsilon)
             is_limit_down = (curr_close <= prev_close * (1 - limit) + epsilon) and (
-                        abs(curr_close - curr_low) < epsilon)
+                    abs(curr_close - curr_low) < epsilon)
             return is_limit_up, is_limit_down
         except IndexError:
             return False, False
@@ -88,41 +90,76 @@ class ModelDrivenStrategy(bt.Strategy):
         target_codes = self.signal_dict.get(current_date, [])
         target_set = set(target_codes)
 
-        for data in self.datas:
+        # [Fix] 1. Pre-calculate positions to handle rotation in same bar
+        # 预先计算当前持仓，以便在卖出逻辑中操作
+        holding_datas = [d for d in self.datas if self.getposition(d).size > 0]
+        current_pos_count = len(holding_datas)
+
+        # [Fix] 2. Track virtual resources released by sells (解决轮动滞后问题)
+        # 记录本轮循环中发出的卖单释放的“虚拟资金”和“虚拟仓位”
+        freed_slots = 0
+        estimated_cash_release = 0.0
+
+        # --- Sell Logic ---
+        for data in holding_datas:
+            name = data._name
             pos = self.getposition(data).size
-            if pos > 0:
-                name = data._name
-                is_limit_up, is_limit_down = self.check_limit_status(data, name)
-                if is_limit_down: continue
 
-                should_sell = False
-                if name not in target_set: should_sell = True
+            # Check Limit Down (Cannot sell)
+            is_limit_up, is_limit_down = self.check_limit_status(data, name)
+            if is_limit_down:
+                continue
 
-                self.hold_time[name] = self.hold_time.get(name, 0) + 1
-                if self.hold_time[name] >= self.p.hold_days: should_sell = True
+            should_sell = False
+            # Condition A: Not in target list anymore
+            if name not in target_set:
+                should_sell = True
 
-                if should_sell:
-                    self.close(data=data)
-                    self.hold_time[name] = 0
+            # Condition B: Held too long
+            self.hold_time[name] = self.hold_time.get(name, 0) + 1
+            if self.hold_time[name] >= self.p.hold_days:
+                should_sell = True
 
+            if should_sell:
+                self.close(data=data)
+                self.hold_time[name] = 0
+
+                # [Fix] Accumulate virtual resources
+                # 累加释放的资源供 Buy Logic 使用
+                freed_slots += 1
+                estimated_cash_release += abs(pos) * data.close[0]
+
+        # --- Buy Logic ---
         if not target_codes: return
-        cash = self.broker.get_cash()
-        if cash < 1000: return
 
-        current_pos_count = sum(1 for d in self.datas if self.getposition(d).size > 0)
-        slots_available = self.p.top_k - current_pos_count
-        if slots_available <= 0: return
+        # [Fix] 3. Use virtual cash for sizing
+        # 使用 当前现金 + 预期回款 计算可用资金
+        current_cash = self.broker.get_cash()
+        total_available_cash = current_cash + estimated_cash_release
 
-        target_val_per_slot = cash / slots_available * 0.98
+        if total_available_cash < 1000: return
+
+        # [Fix] 4. Use virtual slots
+        # 实际可用仓位 = (TopK - 当前持仓数) + 本轮卖出的仓位
+        real_slots_gap = self.p.top_k - current_pos_count
+        effective_slots = real_slots_gap + freed_slots
+
+        if effective_slots <= 0: return
+
+        # [Updated] 使用 Config.CASH_BUFFER 进行资金利用率控制
+        target_val_per_slot = total_available_cash / effective_slots * self.p.cash_buffer
 
         buy_count = 0
         for code in target_codes:
-            if buy_count >= slots_available: break
+            if buy_count >= effective_slots: break
 
             data = self.getdatabyname(code)
             if data is None: continue
+
+            # Skip if we already hold it
             if self.getposition(data).size > 0: continue
 
+            # Limit Up check (Cannot buy)
             is_limit_up, is_limit_down = self.check_limit_status(data, code)
             if is_limit_up: continue
 
@@ -240,6 +277,12 @@ class WalkForwardBacktester:
 
         cerebro = bt.Cerebro()
         cerebro.broker.setcash(self.initial_cash)
+
+        # [Fix] 5. Disable CheckSubmit
+        # 允许策略在 T 日使用“未来”资金（T+1 卖出回款）下买单
+        # Backtrader 默认会拒绝余额不足的订单，这里必须禁用检查，依赖执行顺序（先卖后买）
+        cerebro.broker.set_checksubmit(False)
+
         cerebro.broker.addcommissioninfo(AShareCommission())
         cerebro.broker.set_slippage_perc(Config.SLIPPAGE)
 
@@ -334,30 +377,49 @@ class TopKStrategy(bt.Strategy):
     params = (
         ('top_k', Config.TOP_K),
         ('hold_days', Config.PRED_LEN),
-        ('min_volume_percent', Config.MIN_VOLUME_PERCENT)
+        ('min_volume_percent', Config.MIN_VOLUME_PERCENT),
+        ('cash_buffer', Config.CASH_BUFFER),  # [Updated] Add param
     )
 
     def __init__(self):
         self.hold_time = {}
 
     def next(self):
-        for data in self.datas:
-            if self.getposition(data).size > 0:
-                self.hold_time[data._name] = self.hold_time.get(data._name, 0) + 1
-                if self.hold_time[data._name] >= self.p.hold_days:
-                    self.close(data=data)
-                    self.hold_time[data._name] = 0
+        # [Fix] Apply same logic to Baseline Strategy
+        holding_datas = [d for d in self.datas if self.getposition(d).size > 0]
+        current_pos_count = len(holding_datas)
 
-        cash = self.broker.get_cash()
-        if cash < 1000: return
-        current_pos = len([d for d in self.datas if self.getposition(d).size > 0])
-        slots = self.p.top_k - current_pos
-        if slots <= 0: return
-        target = cash / slots * 0.98
+        freed_slots = 0
+        estimated_cash_release = 0.0
+
+        for data in holding_datas:
+            self.hold_time[data._name] = self.hold_time.get(data._name, 0) + 1
+            if self.hold_time[data._name] >= self.p.hold_days:
+                pos = self.getposition(data).size
+                self.close(data=data)
+                self.hold_time[data._name] = 0
+
+                # Virtual Release
+                freed_slots += 1
+                estimated_cash_release += abs(pos) * data.close[0]
+
+        # Use virtual resources
+        current_cash = self.broker.get_cash()
+        total_available_cash = current_cash + estimated_cash_release
+
+        if total_available_cash < 1000: return
+
+        real_slots_gap = self.p.top_k - current_pos_count
+        effective_slots = real_slots_gap + freed_slots
+
+        if effective_slots <= 0: return
+
+        # [Updated] 使用 Config.CASH_BUFFER
+        target = total_available_cash / effective_slots * self.p.cash_buffer
 
         buy_cnt = 0
         for data in self.datas:
-            if buy_cnt >= slots: break
+            if buy_cnt >= effective_slots: break
             if self.getposition(data).size == 0:
                 price = data.close[0];
                 vol = data.volume[0]
@@ -433,6 +495,9 @@ class PerformanceAnalyzer:
 def run_single_backtest(codes, with_fees=True, initial_cash=1000000.0, top_k=Config.TOP_K):
     cerebro = bt.Cerebro()
     cerebro.broker.setcash(initial_cash)
+
+    # [Fix] Apply fix to single backtest too
+    cerebro.broker.set_checksubmit(False)
 
     if with_fees:
         cerebro.broker.addcommissioninfo(AShareCommission())
