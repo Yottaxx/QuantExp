@@ -21,8 +21,16 @@ class AlphaFactory:
             self.df = self.df.reset_index()
 
         self.returns = self.close.pct_change()
+
+        # [Jeff Dean Fix] Safe Logarithm
+        # Ensure inputs are strictly positive with epsilon buffer
+        def safe_log(series):
+            return np.log(np.abs(series) + 1e-9)
+
+        self.safe_log = safe_log
+
         self.vwap = (self.volume * (self.high + self.low + self.close) / 3).cumsum() / (self.volume.cumsum() + 1e-9)
-        self.log_ret = np.log((self.close + 1e-9) / (self.close.shift(1) + 1e-9))
+        self.log_ret = safe_log(self.close / (self.close.shift(1) + 1e-9))
 
     def make_factors(self) -> pd.DataFrame:
         self._build_style_factors()
@@ -38,22 +46,17 @@ class AlphaFactory:
     @staticmethod
     def _orthogonalize_factors(df, factor_cols):
         M = df[factor_cols].fillna(0).values
-        # 标准化
         try:
             M_mean = np.mean(M, axis=0)
             M_std = np.std(M, axis=0) + 1e-9
             M = (M - M_mean) / M_std
 
-            # SVD 分解
             U, S, Vh = np.linalg.svd(M, full_matrices=False)
             M_orth = np.dot(U, Vh)
 
-            # 恢复尺度 (可选，这里保持正态分布)
             M_orth = (M_orth - np.mean(M_orth, axis=0)) / (np.std(M_orth, axis=0) + 1e-9)
             return pd.DataFrame(M_orth, columns=factor_cols, index=df.index)
         except Exception as e:
-            # 【修正】增加日志，且返回原始数据以防崩溃
-            # print(f"Warning: SVD failed for date {df.name if hasattr(df, 'name') else 'Unknown'}: {e}")
             return df[factor_cols]
 
     @staticmethod
@@ -104,15 +107,15 @@ class AlphaFactory:
 
         return panel_df
 
-    # ... [Build functions 保持不变] ...
     def _build_style_factors(self):
         self.df['style_mom_1m'] = ops.ts_sum(self.log_ret, 20)
         self.df['style_mom_3m'] = ops.ts_sum(self.log_ret, 60)
         self.df['style_mom_6m'] = ops.ts_sum(self.log_ret, 120)
         self.df['style_vol_1m'] = ops.ts_std(self.returns, 20)
         self.df['style_vol_3m'] = ops.ts_std(self.returns, 60)
-        self.df['style_liquidity'] = np.log(ops.ts_sum(self.volume, 20) + 1)
-        self.df['style_size_proxy'] = np.log(self.close * self.volume + 1)
+        # [Fix] Use safe_log
+        self.df['style_liquidity'] = self.safe_log(ops.ts_sum(self.volume, 20) + 1)
+        self.df['style_size_proxy'] = self.safe_log(self.close * self.volume + 1)
         self.df['style_beta_proxy'] = ops.ts_corr(self.returns, self.returns.shift(1), 20)
 
     def _build_technical_factors(self):
@@ -168,17 +171,19 @@ class AlphaFactory:
         self.df['adv_ker_10'] = change / (volatility + 1e-9)
         dollar_volume = self.close * self.volume
         self.df['adv_amihud'] = self.returns.abs() / (dollar_volume + 1e-9)
-        hl_ratio = np.log(self.high / self.low)
+        # [Fix] Use safe_log
+        hl_ratio = self.safe_log(self.high / self.low)
         self.df['adv_spread_proxy'] = ops.ts_mean(hl_ratio, 5)
         vol_window = 5
         rolling_vol = ops.ts_std(self.returns, vol_window)
         self.df['adv_vol_of_vol'] = ops.ts_std(rolling_vol, 20)
 
     def _build_industrial_factors(self):
-        o_c_lag = np.log(self.open / self.close.shift(1))
-        c_o = np.log(self.close / self.open)
-        rs_vol = np.log(self.high / self.close) * np.log(self.high / self.open) + \
-                 np.log(self.low / self.close) * np.log(self.low / self.open)
+        # [Fix] Use safe_log for all volatility calcs
+        o_c_lag = self.safe_log(self.open / self.close.shift(1))
+        c_o = self.safe_log(self.close / self.open)
+        rs_vol = self.safe_log(self.high / self.close) * self.safe_log(self.high / self.open) + \
+                 self.safe_log(self.low / self.close) * self.safe_log(self.low / self.open)
         N = 20
         k = 0.34
         sigma_open = ops.ts_std(o_c_lag, N) ** 2
@@ -193,7 +198,8 @@ class AlphaFactory:
         self.df['ind_vol_cv'] = ops.ts_std(self.volume, 20) / (ops.ts_mean(self.volume, 20) + 1e-9)
         body_len = (self.close - self.open).abs()
         total_len = (self.high - self.low) + 1e-9
-        self.df['ind_smart_money'] = (body_len / total_len) * np.log(self.volume + 1)
+        # [Fix] Use safe_log
+        self.df['ind_smart_money'] = (body_len / total_len) * self.safe_log(self.volume + 1)
 
     def _build_calendar_factors(self):
         if 'date' not in self.df.columns: return
@@ -206,10 +212,6 @@ class AlphaFactory:
         factor_cols = [c for c in self.df.columns
                        if any(c.startswith(p) for p in Config.FEATURE_PREFIXES)]
         self.df.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-        # 【修正】使用 0 而不是 ffill 填充 Z-Score 预处理前的空值
-        # ffill 容易造成僵尸数据（停牌期间数据不变，导致波动率计算为0，zscore异常）
-        # 对于 Rolling 窗口产生的 NaN，填 0 (均值) 是更安全的选择
         self.df[factor_cols] = self.df[factor_cols].fillna(0)
 
         for col in factor_cols:
@@ -219,5 +221,4 @@ class AlphaFactory:
             series = series.clip(-4, 4)
             self.df[col] = series
 
-        # 二次填充，防止 Z-Score 计算后产生新的 NaN
         self.df[factor_cols] = self.df[factor_cols].fillna(0)

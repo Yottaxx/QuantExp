@@ -60,8 +60,11 @@ def mock_env(tmp_path):
     Config.OUTPUT_DIR = original_output_dir
 
 
-def create_synthetic_data(mock_cfg, days=100):
-    """生成足够用于 Training + Gap + Inference 的数据"""
+def create_synthetic_data(mock_cfg, days=300):
+    """
+    生成足够用于 Training + Gap + Inference 的数据
+    [Fix] 增加到 300 天，确保 90% Split (270天) 后，剩余 30 天扣除 Gap (10天) 还有 20 天给 Test 集。
+    """
     dates = pd.date_range("2024-01-01", periods=days, freq="B")
     codes = ["000001", "000002"]
 
@@ -122,6 +125,7 @@ def test_full_system_lifecycle(mock_env, capsys):
     print("\n>>> [Step 2] Dataset Generation...")
     ds, num_features = DataProvider.make_dataset(panel_df, feature_cols)
     assert len(ds['train']) > 0
+    # [Check] 确保 Test 集不为空，否则 Generator 会抛错
     assert len(ds['test']) > 0
     print(f"✅ Dataset Created. Train: {len(ds['train'])}, Test: {len(ds['test'])}")
 
@@ -205,7 +209,9 @@ def test_full_system_lifecycle(mock_env, capsys):
     print("\n>>> [Step 5] Backtest Execution...")
     # 构造 Backtest 需要的 Signal DataFrame
     # 我们手动制造一个强信号：000001 极高分，000002 极低分
-    signals = pd.DataFrame(index=pred_df['date'].unique(), columns=codes, dtype=float)
+    # [Fix] 确保索引是 DatetimeIndex，以便 Backtest 引擎能正确索引
+    unique_dates = sorted(pred_df['date'].unique())
+    signals = pd.DataFrame(index=unique_dates, columns=codes, dtype=float)
     signals[:] = -100.0  # 默认无效
 
     # 在所有日期对 000001 发出买入信号
@@ -214,10 +220,7 @@ def test_full_system_lifecycle(mock_env, capsys):
 
         # 运行回测
     # 注意：我们需要为回测提供行情数据，这里复用之前生成的 Parquet
-    active_stocks = [("000001", 100.0)]  # 模拟筛选结果
-
     # 这里的 Config 已经被 monkeypatch 了，需要确保回测引擎能读到 Mock Data
-    # run_single_backtest 内部会读取 Config.DATA_DIR，正是我们的 mock_env
     result = run_single_backtest(["000001"], with_fees=True, initial_cash=100000.0, top_k=1)
 
     assert result is not None

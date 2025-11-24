@@ -5,9 +5,19 @@ from transformers.modeling_outputs import SequenceClassifierOutput
 
 
 class SotaConfig(PatchTSTConfig):
-    def __init__(self, mse_weight=0.5, **kwargs):
+    def __init__(self, mse_weight=0.5, stride=None, **kwargs):
+        # [Jeff Dean Fix] Explicitly handle 'stride' to ensure it propagates to parent config.
+        # Some transformer versions might default 'stride' if not passed explicitly in args.
+        if stride is not None:
+            kwargs['stride'] = stride
+
         super().__init__(**kwargs)
         self.mse_weight = mse_weight
+
+        # Double enforcement: Ensure self.stride matches what we expect
+        # yotta fix this model key parameter for stride is patch_stride
+        if stride is not None:
+            self.patch_stride = stride
 
 
 class HybridLoss(nn.Module):
@@ -45,9 +55,12 @@ class PatchTSTForStock(PatchTSTPreTrainedModel):
         super().__init__(config)
         self.model = PatchTSTModel(config)
 
+        # [Verification] Ensure config.stride is respected in logic
+        # If config.stride=1, patch count increases.
+        # If config.stride > 1 (e.g., 2), patch count decreases.
         num_patches = (config.context_length - config.patch_length) // config.stride + 1
 
-        # 增强 Head：增加一层 MLP 以提升非线性表达能力
+        # Linear Head
         self.head = nn.Sequential(
             nn.Flatten(),
             nn.Linear(config.d_model * config.num_input_channels * num_patches, 512),

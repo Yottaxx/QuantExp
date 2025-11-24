@@ -16,7 +16,6 @@ from .config import Config
 from .vpn_rotator import vpn_rotator
 from .alpha_lib import AlphaFactory
 
-# 忽略 pandas 的 SettingWithCopyWarning
 warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 
 
@@ -24,19 +23,14 @@ class DataProvider:
     _vpn_lock = threading.Lock()
     _last_switch_time = 0
 
-    # --------------------------------------------------------------------------
-    # PART 1: 基础设施
-    # --------------------------------------------------------------------------
     @staticmethod
     def _setup_proxy_env():
-        """配置系统代理环境"""
         proxy_url = Config.PROXY_URL
         for k in ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']:
             os.environ[k] = proxy_url
 
     @classmethod
     def _safe_switch_vpn(cls):
-        """线程安全的 VPN 轮换"""
         with cls._vpn_lock:
             if time.time() - cls._last_switch_time < 5: return
             vpn_rotator.switch_random()
@@ -45,7 +39,6 @@ class DataProvider:
 
     @staticmethod
     def _get_latest_trading_date():
-        """获取最近交易日"""
         try:
             df = ak.stock_zh_index_daily(symbol=Config.MARKET_INDEX_SYMBOL)
             return pd.to_datetime(df['date']).max().date().strftime("%Y-%m-%d")
@@ -54,9 +47,6 @@ class DataProvider:
 
     @staticmethod
     def _fetch_pub_date_map(code):
-        """
-        获取真实的财报披露日期，消除 Look-ahead Bias
-        """
         try:
             df = ak.stock_financial_abstract(symbol=code)
             if df is None or df.empty: return None
@@ -73,7 +63,6 @@ class DataProvider:
 
     @staticmethod
     def _download_finance_worker(code):
-        """下载财务数据，严格处理披露日期"""
         fund_dir = os.path.join(Config.DATA_DIR, "fundamental")
         if not os.path.exists(fund_dir): os.makedirs(fund_dir)
         path = os.path.join(fund_dir, f"{code}.parquet")
@@ -96,7 +85,6 @@ class DataProvider:
                 df = df[['date'] + valid_cols].copy()
                 df.rename(columns=cols_map, inplace=True)
 
-                # --- 严格的披露日期对齐 ---
                 pub_df = DataProvider._fetch_pub_date_map(code)
                 if pub_df is not None:
                     df = pd.merge(df, pub_df, on='date', how='left')
@@ -117,7 +105,6 @@ class DataProvider:
 
     @staticmethod
     def _download_worker(code):
-        """下载日线行情，严格的单位判定"""
         path = os.path.join(Config.DATA_DIR, f"{code}.parquet")
         for attempt in range(5):
             try:
@@ -141,12 +128,9 @@ class DataProvider:
 
                 df.dropna(inplace=True)
 
-                # --- 核心修复：单位自适应 (手 vs 股) ---
-                # 仅使用最近 20 天数据判断，避免历史 QFQ 价格过小导致的系统性偏差
                 if 'amount' in df.columns and 'volume' in df.columns and 'close' in df.columns:
                     valid_sample = df[(df['volume'] > 0) & (df['amount'] > 0)].tail(20)
                     if not valid_sample.empty:
-                        # 理论值：手=100，股=1
                         multiplier = (
                                     valid_sample['amount'] / (valid_sample['close'] * valid_sample['volume'])).median()
                         if multiplier > 50:
@@ -165,19 +149,13 @@ class DataProvider:
                 continue
         return code, False, "Failed"
 
-    # --------------------------------------------------------------------------
-    # PART 2: 数据处理核心 (ETL)
-    # --------------------------------------------------------------------------
-
     @staticmethod
     def download_data():
-        """执行全量数据下载"""
         print(">>> [ETL] 启动数据下载流水线...")
         DataProvider._setup_proxy_env()
         if not os.path.exists(Config.DATA_DIR): os.makedirs(Config.DATA_DIR)
 
         try:
-            # 注意：此处存在幸存者偏差风险，akshare 仅返回当前上市股票
             stock_info = ak.stock_zh_a_spot_em()
             codes = stock_info['代码'].tolist()
         except:
@@ -186,7 +164,6 @@ class DataProvider:
 
         target_date_str = DataProvider._get_latest_trading_date()
 
-        # 增量更新逻辑
         existing_fresh = set()
         for fname in os.listdir(Config.DATA_DIR):
             if fname.endswith(".parquet"):
@@ -220,23 +197,12 @@ class DataProvider:
 
     @staticmethod
     def _tag_universe(panel_df):
-        """
-        【逻辑修正】标记 Universe 而非直接删除行
-        防止删除行后导致的时间序列断裂 (Time-Series Discontinuity)
-        """
         print(">>> [Tagging] 标记动态股票池 (Universe Mask)...")
-
-        # 基础条件
         cond_vol = panel_df['volume'] > 0
-        cond_price = panel_df['close'] >= 2.0  # 剔除 penny stocks
-
-        # 上市时间 > 60天
+        cond_price = panel_df['close'] >= 2.0
         list_days = panel_df.groupby('code')['date'].transform('count')
         cond_list = list_days > 60
-
-        # 综合标记
         panel_df['is_universe'] = cond_vol & cond_price & cond_list
-
         valid_count = panel_df['is_universe'].sum()
         total_count = len(panel_df)
         print(f"Universe 覆盖率: {valid_count}/{total_count} ({valid_count / total_count:.2%})")
@@ -254,10 +220,14 @@ class DataProvider:
         price_files = glob.glob(os.path.join(Config.DATA_DIR, "*.parquet"))
         fund_dir = os.path.join(Config.DATA_DIR, "fundamental")
 
-        # 1. 读取日线
         def _read_price(f):
             try:
                 df = pd.read_parquet(f)
+                # [Jeff Dean Fix] Force reset index to ensure 'date' is a regular column
+                # This prevents KeyError: 'date' in downstream concat/processing
+                if isinstance(df.index, pd.DatetimeIndex) and 'date' not in df.columns:
+                    df = df.reset_index()
+
                 df['code'] = os.path.basename(f).replace(".parquet", "")
                 float_cols = df.select_dtypes(include=['float64']).columns
                 df[float_cols] = df[float_cols].astype(np.float32)
@@ -270,12 +240,11 @@ class DataProvider:
 
         data_frames = [df for df in results if df is not None and len(df) > Config.CONTEXT_LEN]
         if not data_frames: raise ValueError("没有足够的有效行情数据")
-        panel_df = pd.concat(data_frames, ignore_index=False)
+        panel_df = pd.concat(data_frames, ignore_index=True)
         del data_frames
         panel_df['code'] = panel_df['code'].astype(str)
         panel_df['date'] = pd.to_datetime(panel_df['date'])
 
-        # 2. 读取并合并财务数据 (PIT - Point In Time 处理)
         fund_files = glob.glob(os.path.join(fund_dir, "*.parquet"))
 
         def _read_fund(f):
@@ -293,16 +262,10 @@ class DataProvider:
             fund_df = pd.concat(fund_frames)
             fund_df = fund_df.reset_index().sort_values(['code', 'date'])
 
-            # 【核心逻辑修正】构建 merge_date
             if 'pub_date' in fund_df.columns:
                 fund_df['merge_date'] = fund_df['pub_date']
-
-                # 处理缺失披露日期的逻辑 (尤其是 Q4 年报)
                 mask_na = fund_df['merge_date'].isna()
-                # 提取报告期月份
                 report_months = fund_df.loc[mask_na, 'date'].dt.month
-
-                # 规则：12月年报默认延后120天(4/30)，其他季报延后60天
                 delays = report_months.apply(lambda m: 120 if m == 12 else 60)
                 fund_df.loc[mask_na, 'merge_date'] = fund_df.loc[mask_na, 'date'] + pd.to_timedelta(delays, unit='D')
             else:
@@ -322,7 +285,6 @@ class DataProvider:
         panel_df = panel_df.reset_index().sort_values(['code', 'date'])
 
         print("计算时序因子...")
-        # 必须在 Universe 过滤前计算，保证时序连续性
         panel_df = panel_df.groupby('code', group_keys=False).apply(lambda x: AlphaFactory(x).make_factors())
 
         print("构造预测目标 (Labels)...")
@@ -334,7 +296,6 @@ class DataProvider:
         if mode == 'train':
             panel_df.dropna(subset=['target'], inplace=True)
 
-        # --- 标记 Universe (不删除行) ---
         panel_df = DataProvider._tag_universe(panel_df)
 
         print("计算截面因子与标准化...")
@@ -354,13 +315,6 @@ class DataProvider:
 
     @staticmethod
     def make_dataset(panel_df, feature_cols):
-        """
-        构造 Dataset
-        【关键修复】
-        1. 仅选择 is_universe=True 的点作为切片终点
-        2. 确保切片内的时间连续性
-        3. Train/Test 之间增加 Purging Gap
-        """
         print(">>> [Dataset] 转换张量格式...")
         panel_df = panel_df.sort_values(['code', 'date']).reset_index(drop=True)
 
@@ -390,7 +344,6 @@ class DataProvider:
 
         valid_indices = np.array(valid_indices)
 
-        # --- 时间切分 (Purged K-Fold 思想) ---
         unique_dates = np.sort(np.unique(dates))
         split_idx = int(len(unique_dates) * 0.9)
         split_date = unique_dates[split_idx]
@@ -398,8 +351,6 @@ class DataProvider:
         sample_pred_dates = dates[valid_indices + seq_len - 1]
 
         train_mask = sample_pred_dates < split_date
-
-        # Gap = Context Length (避免 Train 末尾的数据作为 Valid 开头的 Past Values)
         gap_date = unique_dates[min(split_idx + Config.CONTEXT_LEN, len(unique_dates) - 1)]
         test_mask = sample_pred_dates > gap_date
 
