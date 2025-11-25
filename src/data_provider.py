@@ -15,8 +15,10 @@ from tqdm import tqdm
 from .config import Config
 from .vpn_rotator import vpn_rotator
 from .alpha_lib import AlphaFactory
-
+from pandarallel import pandarallel
 warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
+# 1. 初始化并行环境 (progress_bar=True 开启进度条)
+pandarallel.initialize(progress_bar=True, nb_workers=os.cpu_count())  # nb_workers 根据你的CPU核数调整，默认是全部
 
 
 class DataProvider:
@@ -243,7 +245,7 @@ class DataProvider:
         panel_df = pd.concat(data_frames, ignore_index=True)
         del data_frames
         panel_df['code'] = panel_df['code'].astype(str)
-        panel_df['date'] = pd.to_datetime(panel_df['date'])
+        panel_df['date'] = pd.to_datetime(panel_df['index'])
 
         fund_files = glob.glob(os.path.join(fund_dir, "*.parquet"))
 
@@ -285,7 +287,9 @@ class DataProvider:
         panel_df = panel_df.reset_index().sort_values(['code', 'date'])
 
         print("计算时序因子...")
-        panel_df = panel_df.groupby('code', group_keys=False).apply(lambda x: AlphaFactory(x).make_factors())
+        # panel_df = panel_df.groupby('code', group_keys=False).apply(lambda x: AlphaFactory(x).make_factors())
+        # 将 apply 替换为 parallel_apply
+        panel_df = panel_df.groupby('code', group_keys=False).parallel_apply(lambda x: AlphaFactory(x).make_factors())
 
         print("构造预测目标 (Labels)...")
         panel_df['next_open'] = panel_df.groupby('code')['open'].shift(-1)

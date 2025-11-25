@@ -71,12 +71,12 @@ def run_training():
         max_grad_norm=Config.MAX_GRAD_NORM,  # 梯度裁剪
 
         # 评估策略
-        evaluation_strategy="steps",
-        eval_steps=200,
-        save_steps=200,
+        eval_strategy="steps",
+        eval_steps=2000,
+        save_steps=2000,
         save_total_limit=2,  # 只保留最近2个Checkpoint，节省空间
 
-        logging_steps=50,
+        logging_steps=500,
         fp16=torch.cuda.is_available(),  # 自动开启混合精度
         dataloader_num_workers=0,  # 避免多进程死锁 (特别是 DataLoader 在 AkShare 环境下)
 

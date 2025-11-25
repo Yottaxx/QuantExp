@@ -2,6 +2,10 @@ import pandas as pd
 import numpy as np
 from . import factor_ops as ops
 from .config import Config
+from pandarallel import pandarallel
+import os
+
+pandarallel.initialize(progress_bar=True, nb_workers=os.cpu_count())  # nb_workers 根据你的CPU核数调整，默认是全部
 
 
 class AlphaFactory:
@@ -97,7 +101,9 @@ class AlphaFactory:
             def apply_orth_wrapper(g):
                 return AlphaFactory._orthogonalize_factors(g, style_cols)
 
-            orth_results = panel_df.groupby('date', group_keys=False)[style_cols].apply(apply_orth_wrapper)
+            # orth_results = panel_df.groupby('date', group_keys=False)[style_cols].apply(apply_orth_wrapper)
+            print("开始按日期分组，并并行计算正交化结果...")
+            orth_results = panel_df.groupby('date', group_keys=False)[style_cols].parallel_apply(apply_orth_wrapper)
             panel_df.update(orth_results)
 
         if 'target' in panel_df.columns:

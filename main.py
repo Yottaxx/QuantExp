@@ -1,6 +1,7 @@
 import argparse
 import warnings
 import os
+from utils.seed_utils import set_global_seed
 
 warnings.filterwarnings("ignore")
 for k in ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']:
@@ -18,7 +19,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SOTA Quant System v8.3 (Fixed)")
 
     # 增加 test 和 debug_proxy 模式
-    parser.add_argument('--mode', type=str, required=True,
+    parser.add_argument('--mode', type=str, required=False,default="train",
                         choices=['download', 'train', 'predict', 'analysis', 'backtest', 'test', 'debug_proxy'],
                         help='运行模式: [download|train|predict|analysis|backtest|test|debug_proxy]')
 
@@ -39,6 +40,9 @@ if __name__ == "__main__":
     Config.DROPOUT = args.dropout
     # 如果命令行传入了 top_k，也更新 Config (虽然函数调用时已传参，但保持一致性更好)
     Config.TOP_K = args.top_k
+
+    SEED = Config.SEED
+    set_global_seed(SEED)
 
     print(f"\n🚀 System Launching... Mode: [{args.mode}]")
     print(f"🔧 Config: TopK={args.top_k}, MSE_Weight={args.mse_weight}, Dropout={args.dropout}")

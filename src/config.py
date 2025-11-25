@@ -8,7 +8,7 @@ class Config:
     管理所有超参数、路径配置、网络设置和常量。
     """
     # --- 基础路径 (使用绝对路径确保稳定) ---
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     DATA_DIR = os.path.join(BASE_DIR, "data", "stock_lake")
     OUTPUT_DIR = os.path.join(BASE_DIR, "output", "checkpoints")
 
@@ -16,7 +16,7 @@ class Config:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # --- 数据参数 ---
-    START_DATE = "20100101"  # 扩大训练窗口覆盖牛熊周期
+    START_DATE = "20240101"  # 扩大训练窗口覆盖牛熊周期
 
     # --- 网络与代理配置 ---
     PROXY_URL = "http://127.0.0.1:7890"
@@ -32,6 +32,9 @@ class Config:
         'style_', 'tech_', 'alpha_', 'adv_', 'ind_', 'fund_',
         'cs_rank_', 'mkt_', 'rel_', 'time_'
     ]
+
+    # --- 随机数种子 ---
+    SEED = 42
 
     # --- 模型参数 (PatchTST) ---
     CONTEXT_LEN = 64  # 增加上下文长度以捕捉中期趋势
