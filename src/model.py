@@ -59,15 +59,15 @@ class PatchTSTForStock(PatchTSTPreTrainedModel):
         # If config.stride=1, patch count increases.
         # If config.stride > 1 (e.g., 2), patch count decreases.
         num_patches = (config.context_length - config.patch_length) // config.stride + 1
-
+        linear_dim = config.d_model
         # Linear Head
         self.head = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(config.d_model * config.num_input_channels * num_patches, 512),
-            nn.BatchNorm1d(512),
+            nn.Linear(config.d_model * config.num_input_channels * num_patches, linear_dim),
+            nn.BatchNorm1d(linear_dim),
             nn.GELU(),
             nn.Dropout(config.dropout),
-            nn.Linear(512, 1)
+            nn.Linear(linear_dim, 1)
         )
 
         weight = getattr(config, 'mse_weight', 0.5)

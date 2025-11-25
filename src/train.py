@@ -48,7 +48,7 @@ def run_training():
         context_length=Config.CONTEXT_LEN,
         patch_length=Config.PATCH_LEN,
         stride=Config.STRIDE,
-        d_model=128,
+        d_model=Config.D_MODEL,
         num_hidden_layers=3,
         n_heads=4,
         dropout=Config.DROPOUT,

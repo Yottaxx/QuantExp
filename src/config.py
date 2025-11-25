@@ -49,7 +49,7 @@ class Config:
     LR = 1e-4
     MSE_WEIGHT = 0.5  # IC Loss 与 MSE 的平衡权重
     MAX_GRAD_NORM = 1.0  # 梯度裁剪阈值
-
+    D_MODEL = 32
     # --- 推理与分析参数 ---
     INFERENCE_BATCH_SIZE = 256
     ANALYSIS_BATCH_SIZE = 2048
