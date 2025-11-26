@@ -39,8 +39,8 @@ class BacktestAnalyzer:
         model.eval()
 
         # 加载数据 (Train 模式包含 Label，用于后续验证)
-        # 强制刷新缓存以确保数据是最新的，或者根据需求 remove force_refresh
         print("Loading Panel Data (Train Mode)...")
+        # 注意：这里不需要 force_refresh，直接利用缓存加快速度
         panel_df, feature_cols = DataProvider.load_and_process_panel(mode='train')
 
         # 筛选时间窗口：需要预留 Context Length 的数据用于 Lookback
@@ -70,13 +70,12 @@ class BacktestAnalyzer:
         else:
             labels = df_sub['target'].values
 
-        # 识别 excess_label
+        # 识别 excess_label (超额收益)，用于分层回测计算
         has_excess = 'excess_label' in df_sub.columns
         excess_vals = df_sub['excess_label'].values if has_excess else df_sub['target'].values
 
         # 获取每个 code 的切片位置，替代 groupby 以提升性能
         # 前提：df_sub 已经按 code, date 排序 (DataProvider 保证了这点)
-        # 利用 pandas 的 index 特性或者 numpy diff 找边界
         unique_codes, code_indices = np.unique(codes, return_index=True)
         # 追加最后一个索引作为结束边界
         code_indices = np.append(code_indices, len(codes))
@@ -94,11 +93,8 @@ class BacktestAnalyzer:
             if series_len < seq_len:
                 continue
 
-            # 向量化构建切片索引
-            # 我们需要预测的时间点索引：从 (start + seq_len - 1) 到 (end - 1)
-            # 对应的输入窗口起始点：从 start 到 (end - seq_len)
-
             # 筛选符合 date 范围的索引
+            # 我们需要预测的时间点索引范围
             curr_dates = dates[start_pos + seq_len - 1: end_pos]
             valid_mask = (curr_dates >= np.datetime64(self.start_date)) & \
                          (curr_dates <= np.datetime64(self.end_date))
@@ -176,7 +172,7 @@ class BacktestAnalyzer:
         # 1. 高效 IC 计算 (使用 Groupby + Rank + Corr 替代 循环 Spearmanr)
         # Spearman IC 本质上就是 Rank 后的 Pearson IC
         # ----------------------------------------------------------------------
-        # 先在组内计算 Rank
+        # 先在组内计算 Rank (截面标准化)
         df['score_rank'] = df.groupby('date')['score'].rank(pct=True)
         df['label_rank'] = df.groupby('date')['rank_label'].rank(pct=True)
 
@@ -192,9 +188,10 @@ class BacktestAnalyzer:
         ic_std = daily_ic.std()
 
         # 年化 ICIR = Mean / Std * sqrt(252)
+        # 衡量因子输出的稳定性，ICIR > 1.0 为优秀
         icir = ic_mean / (ic_std + 1e-9) * np.sqrt(252)
 
-        # IC 胜率
+        # IC 胜率 (IC > 0 的天数占比)
         ic_win_rate = (daily_ic > 0).mean()
 
         # 打印体检报告
@@ -219,7 +216,7 @@ class BacktestAnalyzer:
         plt.figure(figsize=(16, 12))
 
         # --- 子图 1: 累积 IC 曲线 (Cumulative IC) ---
-        # 它是判断因子稳定性的金标准，斜率越稳定越好
+        # 它是判断因子稳定性的金标准，斜率越稳定向上越好
         ax1 = plt.subplot(3, 1, 1)
         daily_ic_cumsum = daily_ic.cumsum()
         ax1.plot(daily_ic_cumsum.index, daily_ic_cumsum.values, label='Cumulative Rank IC', color='#4B0082',
@@ -239,21 +236,21 @@ class BacktestAnalyzer:
         ax2.grid(True, axis='y', linestyle='--', alpha=0.4)
 
         # --- 子图 3: 分层累计收益曲线 (Layered Backtest) ---
+        # 将预测分按 20% 分组，观察 Top 组是否显著跑赢 Bottom 组
         ax3 = plt.subplot(3, 1, 3)
 
-        # 计算分层收益
         # 将 score 分成 5 组 (Group 0: Worst, Group 4: Best)
-        # 注意：duplicates='drop' 防止分数过于集中导致切分失败
+        # duplicates='drop' 防止分数过于集中导致切分失败
         df['group'] = df.groupby('date')['score'].transform(
             lambda x: pd.qcut(x, 5, labels=False, duplicates='drop')
         )
 
-        # 计算每组每日的平均 excess_label
+        # 计算每组每日的平均 excess_label (超额收益)
         layer_ret = df.groupby(['date', 'group'])['excess_label'].mean().unstack()
 
         # [Critical Fix] 修正多日预测带来的收益重叠
-        # 如果预测的是未来 5 日收益，每日累乘会导致收益被放大 5 倍
-        # 这里进行简单的线性平摊，模拟日频收益
+        # 如果预测的是未来 5 日收益，每日累乘会导致收益被放大。
+        # 这里进行简单的线性平摊，模拟日频收益，以便在日线图上展示趋势。
         if Config.PRED_LEN > 1:
             layer_ret = layer_ret / Config.PRED_LEN
 
@@ -262,15 +259,14 @@ class BacktestAnalyzer:
 
         # 绘图逻辑
         groups = sorted(layer_ret.columns)
-        cmap = plt.get_cmap('RdYlGn_r')  # 逆序：红(Top) -> 绿(Bottom)
 
         for idx, g in enumerate(groups):
             if g == groups[-1]:
-                label, c, lw, alpha = "Top 20% (Long)", "red", 2.0, 1.0
+                label, c, lw, alpha = "Top 20% (Long)", "#d32f2f", 2.0, 1.0  # 红色
             elif g == groups[0]:
-                label, c, lw, alpha = "Bottom 20% (Short)", "green", 1.5, 0.8
+                label, c, lw, alpha = "Bottom 20% (Short)", "#388e3c", 1.5, 0.8  # 绿色
             else:
-                label, c, lw, alpha = f"Group {g}", "gray", 0.8, 0.3
+                label, c, lw, alpha = f"Group {g}", "gray", 0.8, 0.3  # 灰色背景
 
             ax3.plot(cum_ret.index, cum_ret[g], label=label, color=c, linewidth=lw, alpha=alpha)
 
@@ -292,7 +288,8 @@ class BacktestAnalyzer:
 
 
 if __name__ == "__main__":
-    # 单元测试
+    # 示例用法
+    # 请确保 Config 中的 START_DATE 和 END_DATE 覆盖了你有数据的区间
     analyzer = BacktestAnalyzer(start_date='2024-01-01', end_date='2024-12-31')
     analyzer.generate_historical_predictions()
     analyzer.analyze_performance()

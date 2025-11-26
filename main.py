@@ -19,7 +19,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SOTA Quant System v8.3 (Fixed)")
 
     # 增加 test 和 debug_proxy 模式
-    parser.add_argument('--mode', type=str, required=False,default="train",
+    parser.add_argument('--mode', type=str, required=False,default="predict",
                         choices=['download', 'train', 'predict', 'analysis', 'backtest', 'test', 'debug_proxy'],
                         help='运行模式: [download|train|predict|analysis|backtest|test|debug_proxy]')
 
