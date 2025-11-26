@@ -84,6 +84,6 @@ if __name__ == "__main__":
         )
 
     elif args.mode == 'analysis':
-        an = BacktestAnalyzer(use_test_set_only=True)
+        an = BacktestAnalyzer(target_set='eval')
         an.generate_historical_predictions()
         an.analyze_performance()
