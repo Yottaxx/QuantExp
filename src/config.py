@@ -45,11 +45,11 @@ class Config:
 
     # --- 训练参数 ---
     BATCH_SIZE = 128
-    EPOCHS = 20  # 增加轮数，依赖 EarlyStopping 控制
+    EPOCHS = 1  # 增加轮数，依赖 EarlyStopping 控制
     LR = 1e-4
     MSE_WEIGHT = 0.5  # IC Loss 与 MSE 的平衡权重
     MAX_GRAD_NORM = 1.0  # 梯度裁剪阈值
-    D_MODEL = 32
+    D_MODEL = 8
     # --- 推理与分析参数 ---
     INFERENCE_BATCH_SIZE = 256
     ANALYSIS_BATCH_SIZE = 2048

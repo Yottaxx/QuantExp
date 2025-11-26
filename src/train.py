@@ -72,8 +72,8 @@ def run_training():
 
         # 评估策略
         eval_strategy="steps",
-        eval_steps=2000,
-        save_steps=2000,
+        eval_steps=1000,
+        save_steps=1000,
         save_total_limit=2,  # 只保留最近2个Checkpoint，节省空间
 
         logging_steps=500,
