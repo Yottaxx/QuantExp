@@ -72,4 +72,5 @@ QLIB因子挖掘
 
 未来泄漏
 
-backtest单票硬止损逻辑
+backtest单票硬止损逻辑 
+backtest  test val 自定义开始结束 逻辑
