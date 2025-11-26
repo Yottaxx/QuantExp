@@ -33,8 +33,8 @@ def run_inference(top_k=Config.TOP_K, min_score_threshold=Config.MIN_SCORE_THRES
     print("=" * 50)
 
     device = Config.DEVICE
-    # model_path = f"{Config.OUTPUT_DIR}/final_model"
-    model_path= "/Users/yotta/PycharmProjects/QuantExp/output/checkpoints/checkpoint-3000"
+    model_path = f"{Config.OUTPUT_DIR}/final_model"
+    # model_path= "/Users/yotta/PycharmProjects/QuantExp/output/checkpoints/checkpoint-3000"
     if not os.path.exists(model_path):
         print("请先运行 train 模式")
         return []

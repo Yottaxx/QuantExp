@@ -18,7 +18,9 @@ class BacktestAnalyzer:
         :param use_test_set_only: 如果为 True，自动覆盖 start_date 为测试集起始日
         """
         self.device = Config.DEVICE
-        self.model_path = f"{Config.OUTPUT_DIR}/final_model"
+        # self.model_path = f"{Config.OUTPUT_DIR}/final_model"
+        self.model_path= "/Users/yotta/PycharmProjects/QuantExp/output/checkpoints/checkpoint-3000"
+
         self.results_df = None
         self.use_test_set_only = use_test_set_only
 
