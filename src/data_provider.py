@@ -1,548 +1,2015 @@
-import akshare as ak
-import pandas as pd
-import numpy as np
-import os
-import glob
-import time
-import random
-import threading
-import datetime
+# -*- coding: utf-8 -*-
+"""data_provider.py (v23)
+
+GOAL: institutional-grade behavior, one-shot:
+- No silent data corruption (adjust meta guard, memmap keying, deterministic code normalize)
+- Reduce survivorship bias (universe union + security master inferred from history)
+- Execution constraints closed-loop for labels (buyable/sellable masks + entry gating)
+- Strong QC contracts (reject with explicit reasons + counters)
+- Reproducible caches (fingerprint + universe_asof + schema/meta)
+- Keep external interface unchanged:
+  * DataProvider.download_data(adjusts=None)
+  * DataProvider.load_and_process_panel(mode="train", force_refresh=False, adjust="qfq", backend=None, debug=False)
+  * DataProvider.make_dataset(panel_df, feature_cols)
+  * get_dataset(force_refresh=False, adjust="qfq")
+"""
+
+from __future__ import annotations
+
 import concurrent.futures
+import datetime as _dt
+import glob
+import hashlib
+import itertools
+import json
+import logging
+import os
 import pickle
+import random
+import re
+import threading
+import time
 import warnings
-import shutil
-from typing import Tuple, List, Optional, Union, Dict
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import akshare as ak
+import numpy as np
+import pandas as pd
 from datasets import Dataset, DatasetDict
 from tqdm import tqdm
-from pandarallel import pandarallel
 
-# 内部模块依赖
+from .alpha_lib import AlphaFactory
 from .config import Config
 from .vpn_rotator import vpn_rotator
-from .alpha_lib import AlphaFactory
 
-# --- 全局配置 ---
-# 忽略 Pandas 的碎片化警告和性能警告
-warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
-warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.filterwarnings("ignore")
 
-# 初始化并行计算 (用于因子计算)
-# verbose=0 静默启动
-pandarallel.initialize(progress_bar=True, nb_workers=os.cpu_count(), verbose=0)
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(
+        level=getattr(logging, str(getattr(Config, "LOG_LEVEL", "INFO")).upper(), logging.INFO),
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+
+# =============================================================================
+# Code normalization (deterministic)
+# =============================================================================
+_CODE6 = re.compile(r"(\d{6})")
 
 
-class DataProvider:
-    """
-    【SOTA Data Engine v11.0 - Industrial Grade】
+def _normalize_code(x: Any) -> Optional[str]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    m = _CODE6.search(s)
+    return m.group(1) if m else None
 
-    Architecture:
-    1. ETL Layer: Atomic IO, Smart Caching, Deep Probing.
-    2. Data Lake: Parquet with Snappy compression.
-    3. Serving Layer: Zero-Copy Lazy Mapping (HuggingFace Arrow).
-    """
 
-    _vpn_lock = threading.Lock()
-    _last_switch_time = 0
+def _norm_code_series(s: pd.Series) -> pd.Series:
+    return s.map(_normalize_code)
 
-    # ==========================================================================
-    # 1. 基础 I/O 与网络设施 (Infrastructure)
-    # ==========================================================================
+
+# =============================================================================
+# Manifest
+# =============================================================================
+@dataclass(frozen=True)
+class ManifestRow:
+    code: str
+    adjust: str
+    last_date: Optional[pd.Timestamp]
+    rows: int
+    updated_at: pd.Timestamp
+    schema_ver: int
+
+
+class ManifestStore:
+    def __init__(self, path: str):
+        self.path = path
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+
+    def load(self) -> pd.DataFrame:
+        if not os.path.exists(self.path) or os.path.getsize(self.path) < 512:
+            return pd.DataFrame(columns=["code", "adjust", "last_date", "rows", "updated_at", "schema_ver"])
+        try:
+            df = pd.read_parquet(self.path)
+        except Exception:
+            return pd.DataFrame(columns=["code", "adjust", "last_date", "rows", "updated_at", "schema_ver"])
+        if "last_date" in df.columns:
+            df["last_date"] = pd.to_datetime(df["last_date"], errors="coerce")
+        if "updated_at" in df.columns:
+            df["updated_at"] = pd.to_datetime(df["updated_at"], errors="coerce")
+        return df
+
+    def save(self, df: pd.DataFrame) -> None:
+        df = df.sort_values(["updated_at"]).drop_duplicates(["code", "adjust"], keep="last")
+        DataProvider._atomic_save_parquet(df, self.path, index=False)
+
+    def upsert_many(self, rows: List[ManifestRow]) -> None:
+        if not rows:
+            return
+        cur = self.load()
+        add = pd.DataFrame(
+            [
+                {
+                    "code": r.code,
+                    "adjust": r.adjust,
+                    "last_date": r.last_date,
+                    "rows": int(r.rows),
+                    "updated_at": r.updated_at,
+                    "schema_ver": int(r.schema_ver),
+                }
+                for r in rows
+            ]
+        )
+        self.save(pd.concat([cur, add], ignore_index=True))
 
     @staticmethod
-    def _setup_proxy_env():
-        """配置系统级代理"""
-        if Config.PROXY_URL:
-            for k in ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']:
-                os.environ[k] = Config.PROXY_URL
+    def to_map(df: pd.DataFrame) -> Dict[Tuple[str, str], Tuple[Optional[pd.Timestamp], int, Optional[pd.Timestamp]]]:
+        out: Dict[Tuple[str, str], Tuple[Optional[pd.Timestamp], int, Optional[pd.Timestamp]]] = {}
+        if df is None or df.empty:
+            return out
+        for rr in df.itertuples(index=False):
+            c = _normalize_code(getattr(rr, "code"))
+            if not c:
+                continue
+            a = DataProvider._norm_adjust(getattr(rr, "adjust"))
+            ld = getattr(rr, "last_date", None)
+            rows = int(getattr(rr, "rows", 0) or 0)
+            ua = getattr(rr, "updated_at", None)
+            out[(c, a)] = (
+                pd.to_datetime(ld, errors="coerce") if ld is not None else None,
+                rows,
+                pd.to_datetime(ua, errors="coerce") if ua is not None else None,
+            )
+        return out
+
+
+# =============================================================================
+# Network: retry + coordinated VPN rotation
+# =============================================================================
+class _VPNCoordinator:
+    _lock = threading.Lock()
+    _last_rotate_ts = 0.0
 
     @classmethod
-    def _safe_switch_vpn(cls):
-        """线程安全的 VPN 轮询"""
-        with cls._vpn_lock:
-            if time.time() - cls._last_switch_time < 5: return
+    def maybe_rotate(cls) -> bool:
+        if not bool(DataProvider._cfg("USE_VPN_ROTATOR", False)):
+            return False
+        if not vpn_rotator:
+            return False
+        cooldown = int(DataProvider._cfg("VPN_ROTATE_COOLDOWN_SEC", 60))
+        now = time.time()
+        with cls._lock:
+            if now - cls._last_rotate_ts < cooldown:
+                return False
             try:
-                # Debug 模式下可开启 print
-                # print("🔄 [Network] Switching Proxy Node...")
-                vpn_rotator.switch_random()
+                logger.warning("🔄 VPN rotate triggered (coordinated).")
+                vpn_rotator()
+                cls._last_rotate_ts = time.time()
+                time.sleep(float(DataProvider._cfg("VPN_POST_ROTATE_SLEEP_SEC", 3.0)))
+                return True
+            except Exception as e:
+                logger.error(f"❌ VPN rotation failed: {e}")
+                return False
+
+
+class _AkErrorClassifier:
+    _compiled = re.compile(
+        "|".join(
+            [
+                r"timeout",
+                r"timed out",
+                r"connection",
+                r"connection reset",
+                r"remote end closed",
+                r"proxy",
+                r"tunnel",
+                r"ssl",
+                r"certificate",
+                r"max retries exceeded",
+                r"\b429\b",
+                r"too many requests",
+                r"\b403\b",
+                r"forbidden",
+                r"blocked",
+                r"captcha",
+                r"频繁",
+                r"访问受限",
+                r"拒绝",
+            ]
+        ),
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def should_rotate(cls, e: Exception) -> bool:
+        return bool(cls._compiled.search(f"{type(e).__name__}: {e}"))
+
+
+class _AkClient:
+    @staticmethod
+    def call(fn, *args, **kwargs):
+        retries = int(DataProvider._cfg("AK_RETRIES", 10))
+        base_sleep = float(DataProvider._cfg("AK_RETRY_BASE_SLEEP", 1.0))
+        max_sleep = float(DataProvider._cfg("AK_RETRY_MAX_SLEEP", 15.0))
+
+        last_e: Optional[Exception] = None
+        for i in range(retries):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                last_e = e
+                logger.warning(f"⚠️ [AkRetry {i + 1}/{retries}] {fn.__name__} failed: {e}")
+                if _AkErrorClassifier.should_rotate(e):
+                    _VPNCoordinator.maybe_rotate()
+                sleep_time = base_sleep * (2 ** i) * (0.8 + random.random() * 0.4)
+                time.sleep(min(sleep_time, max_sleep))
+        logger.critical(f"❌ All {retries} retries failed for {fn.__name__}. Last={last_e}")
+        raise last_e  # type: ignore
+
+
+# =============================================================================
+# Calendar
+# =============================================================================
+class _CalendarStore:
+    @staticmethod
+    def _path() -> str:
+        root = str(DataProvider._cfg("DATA_DIR", "./data"))
+        os.makedirs(os.path.join(root, "calendar"), exist_ok=True)
+        sym = str(DataProvider._cfg("MARKET_INDEX_SYMBOL", "sh000001"))
+        return os.path.join(root, "calendar", f"index_{sym}.parquet")
+
+    @staticmethod
+    def _is_fresh(path: str, ttl: int) -> bool:
+        return os.path.exists(path) and os.path.getsize(path) >= 512 and (time.time() - os.path.getmtime(path)) < ttl
+
+    @classmethod
+    def get_trade_dates(cls) -> pd.DatetimeIndex:
+        path = cls._path()
+        ttl = int(DataProvider._cfg("CALENDAR_TTL_SEC", 7 * 24 * 3600))
+        if cls._is_fresh(path, ttl):
+            try:
+                df = pd.read_parquet(path)
+                d = pd.to_datetime(df["date"], errors="coerce").dropna()
+                return pd.DatetimeIndex(sorted(d.unique()))
             except Exception:
                 pass
-            cls._last_switch_time = time.time()
-            time.sleep(2)
 
-    @staticmethod
-    def _atomic_save(df: pd.DataFrame, file_path: str):
-        """
-        【原子写入】
-        先写入 .tmp，再执行原子替换。防止进程崩溃导致 0 字节文件。
-        """
-        tmp_path = file_path + ".tmp"
+        sym = str(DataProvider._cfg("MARKET_INDEX_SYMBOL", "sh000001"))
+        df = _AkClient.call(ak.stock_zh_index_daily, symbol=sym)
+        if df is None or df.empty:
+            raise RuntimeError("Index daily is empty, cannot build calendar.")
+        d = pd.to_datetime(df["date"], errors="coerce").dropna().sort_values()
+        DataProvider._atomic_save_parquet(pd.DataFrame({"date": d}), path, index=False)
+        return pd.DatetimeIndex(sorted(d.unique()))
+
+    @classmethod
+    def latest_trade_date(cls, today: Optional[pd.Timestamp] = None) -> pd.Timestamp:
+        if today is None:
+            today = pd.Timestamp(_dt.date.today())
         try:
-            df.to_parquet(tmp_path, index=True)
-            # POSIX 原子操作 (Windows Python 3.3+ 支持)
-            os.replace(tmp_path, file_path)
+            dates = cls.get_trade_dates()
+            eligible = dates[dates <= pd.Timestamp(today).normalize()]
+            if len(eligible):
+                return pd.Timestamp(eligible[-1])
         except Exception as e:
-            if os.path.exists(tmp_path): os.remove(tmp_path)
-            raise e
+            logger.warning(f"[Calendar] fallback due to error: {e}")
+
+        d = pd.Timestamp(today).normalize()
+        while d.weekday() >= 5:
+            d -= pd.Timedelta(days=1)
+        return d
+
+
+# =============================================================================
+# Universe + Security Master (reduce survivorship bias)
+# =============================================================================
+class _CodeMeta:
+    @staticmethod
+    def infer_board(code: str) -> str:
+        c = str(code).strip()
+        if c.startswith(("300", "301")):
+            return "GEM"
+        if c.startswith(("688", "689")):
+            return "STAR"
+        if c.startswith(("8", "4")):
+            return "BSE"
+        if c.startswith(("200", "900")):
+            return "BSHARE"
+        return "MAIN"
 
     @staticmethod
-    def _is_data_fresh(file_path: str, target_date_str: str) -> bool:
-        """
-        【深度内容探针】Deep Content Probe
-        只读取 Parquet 索引列 (IO 开销极小)，校验数据是否确实包含目标日期。
-        """
-        if not os.path.exists(file_path): return False
-        if os.path.getsize(file_path) < 1024: return False
-
-        try:
-            # Column Pruning: 只读一列获取 Index
-            df_meta = pd.read_parquet(file_path, columns=['close'])
-            if df_meta.empty: return False
-
-            last_dt = df_meta.index.max()
-            last_date = last_dt.strftime("%Y-%m-%d") if isinstance(last_dt, pd.Timestamp) else str(last_dt)[:10]
-
-            return last_date >= target_date_str
-        except Exception:
+    def is_st(name: Optional[str]) -> bool:
+        if not name:
             return False
+        n = str(name).upper()
+        return "ST" in n
 
     @staticmethod
-    def _get_latest_trading_date() -> str:
-        """获取全市场最新交易日 (Benchmark: SH000001)"""
+    def limit_rate(board: str, is_st: bool) -> float:
+        main = float(DataProvider._cfg("LIMIT_RATE_MAIN", 0.10))
+        st = float(DataProvider._cfg("LIMIT_RATE_ST", 0.05))
+        gem = float(DataProvider._cfg("LIMIT_RATE_GEM", 0.20))
+        star = float(DataProvider._cfg("LIMIT_RATE_STAR", 0.20))
+        bse = float(DataProvider._cfg("LIMIT_RATE_BSE", 0.30))
+        bshare = float(DataProvider._cfg("LIMIT_RATE_BSHARE", 0.10))
+        if board == "BSE":
+            return bse
+        if board == "GEM":
+            return gem
+        if board == "STAR":
+            return star
+        if board == "BSHARE":
+            return bshare
+        return st if is_st else main
+
+
+class _UniverseStore:
+    @staticmethod
+    def _dir() -> str:
+        root = str(DataProvider._cfg("DATA_DIR", "./data"))
+        d = os.path.join(root, "universe")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @classmethod
+    def _snapshot_path(cls, date: pd.Timestamp) -> str:
+        return os.path.join(cls._dir(), f"universe_{pd.Timestamp(date).strftime('%Y%m%d')}.parquet")
+
+    @classmethod
+    def _master_path(cls) -> str:
+        return os.path.join(cls._dir(), "code_master.parquet")
+
+    @staticmethod
+    def _is_fresh(path: str, ttl: int) -> bool:
+        return os.path.exists(path) and os.path.getsize(path) >= 512 and (time.time() - os.path.getmtime(path)) < ttl
+
+    @staticmethod
+    def _extract_code_name(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["code", "name"])
+        code_col = None
+        name_col = None
+        for c in ["代码", "证券代码", "code", "symbol"]:
+            if c in df.columns:
+                code_col = c
+                break
+        for c in ["名称", "证券简称", "name", "short_name"]:
+            if c in df.columns:
+                name_col = c
+                break
+        if code_col is None:
+            return pd.DataFrame(columns=["code", "name"])
+        out = pd.DataFrame({"code": df[code_col]})
+        out["name"] = df[name_col].astype(str) if name_col is not None else ""
+        out["code"] = _norm_code_series(out["code"])
+        out = out.dropna(subset=["code"]).drop_duplicates("code").reset_index(drop=True)
+        out["code"] = out["code"].astype(str)
+        out["name"] = out["name"].fillna("").astype(str)
+        return out
+
+    @staticmethod
+    def _try_all_code_lists() -> pd.DataFrame:
+        cands = [
+            "stock_info_a_code_name",
+            "stock_info_sz_name_code",
+            "stock_info_sh_name_code",
+        ]
+        for fn_name in cands:
+            fn = getattr(ak, fn_name, None)
+            if callable(fn):
+                try:
+                    df = _AkClient.call(fn)
+                    out = _UniverseStore._extract_code_name(df)
+                    if not out.empty:
+                        out["source"] = fn_name
+                        return out
+                except Exception:
+                    continue
+        return pd.DataFrame(columns=["code", "name", "source"])
+
+    @staticmethod
+    def _cached_price_codes() -> pd.DataFrame:
+        rows: List[Dict[str, Any]] = []
+        for adj in ["raw", "qfq", "hfq"]:
+            for p in DataProvider._price_glob(adj):
+                code = _normalize_code(os.path.basename(p).replace(".parquet", ""))
+                if not code:
+                    continue
+                rows.append({"code": code, "name": "", "source": f"price_cache_{adj}"})
+        if not rows:
+            return pd.DataFrame(columns=["code", "name", "source"])
+        return pd.DataFrame(rows).drop_duplicates("code").reset_index(drop=True)
+
+    @staticmethod
+    def _extra_codes_file() -> pd.DataFrame:
+        path = str(DataProvider._cfg("UNIVERSE_EXTRA_CODES_FILE", "") or "").strip()
+        if not path:
+            return pd.DataFrame(columns=["code", "name", "source"])
+        if not os.path.exists(path):
+            logger.warning(f"[Universe] UNIVERSE_EXTRA_CODES_FILE not found: {path}")
+            return pd.DataFrame(columns=["code", "name", "source"])
         try:
-            df = ak.stock_zh_index_daily(symbol=Config.MARKET_INDEX_SYMBOL)
-            return pd.to_datetime(df['date']).max().strftime("%Y-%m-%d")
-        except:
-            return datetime.date.today().strftime("%Y-%m-%d")
-
-    # ==========================================================================
-    # 2. 下载工作流 (Workers)
-    # ==========================================================================
+            if path.lower().endswith(".csv"):
+                df = pd.read_csv(path)
+                out = _UniverseStore._extract_code_name(df)
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    codes = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+                out = pd.DataFrame({"code": _norm_code_series(pd.Series(codes)), "name": ""})
+                out = out.dropna(subset=["code"])
+                out["code"] = out["code"].astype(str)
+            if out.empty:
+                return pd.DataFrame(columns=["code", "name", "source"])
+            out["source"] = "extra_codes_file"
+            return out
+        except Exception as e:
+            logger.warning(f"[Universe] read extra codes failed: {e}")
+            return pd.DataFrame(columns=["code", "name", "source"])
 
     @staticmethod
-    def _download_price_worker(code: str) -> Tuple[str, bool, str]:
-        """日线行情下载器"""
-        path = os.path.join(Config.DATA_DIR, f"{code}.parquet")
+    def _apply_market_filters(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        include_bse = bool(DataProvider._cfg("INCLUDE_BSE", False))
+        include_bshare = bool(DataProvider._cfg("INCLUDE_BSHARE", False))
+        board = df["code"].map(_CodeMeta.infer_board)
 
-        for attempt in range(3):
+        keep = pd.Series(True, index=df.index)
+        if not include_bse:
+            keep &= board != "BSE"
+        if not include_bshare:
+            keep &= board != "BSHARE"
+
+        allow_prefixes = DataProvider._cfg("UNIVERSE_ALLOW_PREFIXES", None)
+        if allow_prefixes:
+            allow_prefixes = [str(x) for x in allow_prefixes]
+            ok = pd.Series(False, index=df.index)
+            for p in allow_prefixes:
+                ok |= df["code"].str.startswith(p)
+            keep &= ok
+
+        return df.loc[keep].reset_index(drop=True)
+
+    @classmethod
+    def get_snapshot(cls, date: pd.Timestamp, force_refresh: bool = False) -> pd.DataFrame:
+        date = pd.Timestamp(date).normalize()
+        path = cls._snapshot_path(date)
+        ttl = int(DataProvider._cfg("UNIVERSE_TTL_SEC", 24 * 3600))
+        if (not force_refresh) and cls._is_fresh(path, ttl):
             try:
-                time.sleep(random.uniform(0.1, 0.4))  # Jitter
-
-                df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=Config.START_DATE, adjust="qfq")
-                if df is None or df.empty: return code, True, "Empty"
-
-                # 规范化
-                rename_map = {'日期': 'date', '开盘': 'open', '收盘': 'close',
-                              '最高': 'high', '最低': 'low', '成交量': 'volume', '成交额': 'amount','换手率': 'turnover'}
-                df.rename(columns=rename_map, inplace=True)
-                df['date'] = pd.to_datetime(df['date'])
-                df.set_index('date', inplace=True)
-
-                # 类型压缩
-                cols = ['open', 'close', 'high', 'low', 'volume', 'amount','turnover']
-                for c in cols:
-                    if c in df.columns:
-                        df[c] = pd.to_numeric(df[c], errors='coerce').astype(np.float32)
-
-                # 单位清洗 (手 vs 股)
-                if 'amount' in df.columns and 'volume' in df.columns:
-                    sample = df[(df['volume'] > 0) & (df['amount'] > 0)].tail(10)
-                    if not sample.empty:
-                        vwap = sample['amount'] / sample['volume']
-                        ratio = (vwap / sample['close']).median()
-                        if 80 < ratio < 120:  # 接近 100
-                            df['volume'] *= 100
-
-                df = df[['open', 'high', 'low', 'close', 'volume','turnover']]
-                df.sort_index(inplace=True)
-
-                DataProvider._atomic_save(df, path)
-                return code, True, "Success"
-
+                return pd.read_parquet(path)
             except Exception:
-                if attempt < 2: DataProvider._safe_switch_vpn()
-                continue
+                pass
 
-        return code, False, "Failed"
+        spot = _AkClient.call(ak.stock_zh_a_spot_em)
+        spot2 = cls._extract_code_name(spot)
+        if not spot2.empty:
+            spot2["source"] = "spot_em"
+        else:
+            spot2 = pd.DataFrame(columns=["code", "name", "source"])
+
+        all_codes = cls._try_all_code_lists()
+        cached = cls._cached_price_codes()
+        extra = cls._extra_codes_file()
+
+        uni = pd.concat([spot2, all_codes, cached, extra], ignore_index=True)
+        if uni.empty:
+            return uni
+
+        uni["code"] = _norm_code_series(uni["code"])
+        uni = uni.dropna(subset=["code"])
+        uni["code"] = uni["code"].astype(str)
+        uni["name"] = uni.get("name", "").fillna("").astype(str)
+
+        uni["_name_ok"] = (uni["name"].str.len() > 0).astype(int)
+        uni = uni.sort_values(["code", "_name_ok", "source"]).drop_duplicates("code", keep="last").drop(columns=["_name_ok"])
+
+        uni = cls._apply_market_filters(uni)
+
+        uni["board"] = uni["code"].map(_CodeMeta.infer_board)
+        uni["is_st"] = uni["name"].map(_CodeMeta.is_st)
+        uni["limit_rate"] = [
+            float(_CodeMeta.limit_rate(b, bool(s))) for b, s in zip(uni["board"].tolist(), uni["is_st"].tolist())
+        ]
+        uni["asof"] = date
+
+        try:
+            DataProvider._atomic_save_parquet(uni.reset_index(drop=True), path, index=False)
+        except Exception as e:
+            logger.warning(f"[Universe] persist snapshot failed: {e}")
+
+        cls._upsert_master(uni)
+        return uni.reset_index(drop=True)
+
+    @classmethod
+    def _upsert_master(cls, snapshot: pd.DataFrame) -> None:
+        mp = cls._master_path()
+        cur = None
+        if os.path.exists(mp) and os.path.getsize(mp) >= 512:
+            try:
+                cur = pd.read_parquet(mp)
+            except Exception:
+                cur = None
+        add = snapshot.copy()
+        out = add if cur is None or cur.empty else pd.concat([cur, add], ignore_index=True)
+        out["asof"] = pd.to_datetime(out["asof"], errors="coerce")
+        out = out.sort_values(["asof"]).drop_duplicates(["code"], keep="last")
+        try:
+            DataProvider._atomic_save_parquet(out.reset_index(drop=True), mp, index=False)
+        except Exception as e:
+            logger.warning(f"[Universe] persist master failed: {e}")
+
+    @classmethod
+    def meta_map_for_asof(cls, date: pd.Timestamp) -> Dict[str, Dict[str, Any]]:
+        date = pd.Timestamp(date).normalize()
+        sp = cls._snapshot_path(date)
+        df = None
+        if os.path.exists(sp) and os.path.getsize(sp) >= 512:
+            try:
+                df = pd.read_parquet(sp)
+            except Exception:
+                df = None
+        if df is None or df.empty:
+            mp = cls._master_path()
+            if os.path.exists(mp) and os.path.getsize(mp) >= 512:
+                try:
+                    df = pd.read_parquet(mp)
+                    logger.warning(f"[Meta] snapshot missing for {date.date()}, fallback to master (ST/limits may bias).")
+                except Exception:
+                    df = None
+
+        if df is None or df.empty:
+            return {}
+
+        df = df.drop_duplicates("code", keep="last")
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in df.itertuples(index=False):
+            code = _normalize_code(getattr(r, "code"))
+            if not code:
+                continue
+            out[code] = {
+                "name": getattr(r, "name", ""),
+                "board": getattr(r, "board", _CodeMeta.infer_board(code)),
+                "is_st": bool(getattr(r, "is_st", False)),
+                "limit_rate": float(getattr(r, "limit_rate", _CodeMeta.limit_rate(_CodeMeta.infer_board(code), False))),
+            }
+        return out
+
+    @classmethod
+    def get_codes(cls, date: pd.Timestamp) -> List[str]:
+        snap = cls.get_snapshot(date)
+        if snap is None or snap.empty:
+            return []
+        return snap["code"].astype(str).tolist()
+
+
+class _SecurityMasterStore:
+    """Security master inferred from local history; optional PIT events can be merged later."""
+    @staticmethod
+    def _dir() -> str:
+        root = str(DataProvider._cfg("DATA_DIR", "./data"))
+        d = os.path.join(root, "security_master")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @classmethod
+    def path(cls) -> str:
+        return os.path.join(cls._dir(), "security_master.parquet")
+
+    @staticmethod
+    def _is_fresh(path: str, ttl: int) -> bool:
+        return os.path.exists(path) and os.path.getsize(path) >= 512 and (time.time() - os.path.getmtime(path)) < ttl
+
+    @classmethod
+    def load(cls) -> pd.DataFrame:
+        p = cls.path()
+        if not os.path.exists(p) or os.path.getsize(p) < 512:
+            return pd.DataFrame(columns=["code", "board", "name", "first_date", "last_date", "is_delisted_guess"])
+        try:
+            df = pd.read_parquet(p)
+            df["first_date"] = pd.to_datetime(df.get("first_date"), errors="coerce")
+            df["last_date"] = pd.to_datetime(df.get("last_date"), errors="coerce")
+            return df
+        except Exception:
+            return pd.DataFrame(columns=["code", "board", "name", "first_date", "last_date", "is_delisted_guess"])
+
+    @classmethod
+    def build_or_update(
+        cls,
+        codes: List[str],
+        adj_norm_for_scan: str,
+        target_dt: pd.Timestamp,
+        meta_map: Dict[str, Dict[str, Any]],
+        force: bool = False,
+    ) -> pd.DataFrame:
+        ttl = int(DataProvider._cfg("SECMASTER_TTL_SEC", 7 * 24 * 3600))
+        p = cls.path()
+        if (not force) and cls._is_fresh(p, ttl):
+            return cls.load()
+
+        scan_price = bool(DataProvider._cfg("SECMASTER_SCAN_PRICE", True))
+        max_scan = int(DataProvider._cfg("SECMASTER_MAX_SCAN_FILES", 0))  # 0 = no cap
+
+        rows: List[Dict[str, Any]] = []
+        if scan_price:
+            files = DataProvider._price_glob(adj_norm_for_scan)
+            if max_scan and len(files) > max_scan:
+                files = files[:max_scan]
+            for pf in tqdm(files, desc="SecMasterScan"):
+                code = _normalize_code(os.path.basename(pf).replace(".parquet", ""))
+                if not code:
+                    continue
+                try:
+                    # read only date column, cheap
+                    d = pd.read_parquet(pf, columns=["date"])
+                    dd = pd.to_datetime(d["date"], errors="coerce").dropna()
+                    if dd.empty:
+                        continue
+                    first_date = dd.min()
+                    last_date = dd.max()
+                except Exception:
+                    continue
+
+                mm = meta_map.get(code, {})
+                name = str(mm.get("name", ""))
+                board = str(mm.get("board", _CodeMeta.infer_board(code)))
+                # delist guess: no update for long time vs target_dt
+                delist_gap = int(DataProvider._cfg("DELIST_GAP_DAYS", 90))
+                is_delisted_guess = bool(last_date < (pd.Timestamp(target_dt) - pd.Timedelta(days=delist_gap)))
+
+                rows.append(
+                    {
+                        "code": code,
+                        "board": board,
+                        "name": name,
+                        "first_date": first_date,
+                        "last_date": last_date,
+                        "is_delisted_guess": is_delisted_guess,
+                    }
+                )
+
+        # Ensure codes from universe are present (even without local price yet)
+        seen = {r["code"] for r in rows}
+        for c in codes:
+            cc = _normalize_code(c)
+            if not cc:
+                continue
+            if cc in seen:
+                continue
+            mm = meta_map.get(cc, {})
+            rows.append(
+                {
+                    "code": cc,
+                    "board": str(mm.get("board", _CodeMeta.infer_board(cc))),
+                    "name": str(mm.get("name", "")),
+                    "first_date": pd.NaT,
+                    "last_date": pd.NaT,
+                    "is_delisted_guess": False,
+                }
+            )
+
+        df = pd.DataFrame(rows).drop_duplicates("code", keep="last")
+        try:
+            DataProvider._atomic_save_parquet(df.reset_index(drop=True), p, index=False)
+        except Exception as e:
+            logger.warning(f"[SecMaster] persist failed: {e}")
+        return df.reset_index(drop=True)
+
+    @classmethod
+    def to_map(cls, df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        if df is None or df.empty:
+            return out
+        for r in df.itertuples(index=False):
+            code = _normalize_code(getattr(r, "code"))
+            if not code:
+                continue
+            out[code] = {
+                "board": getattr(r, "board", _CodeMeta.infer_board(code)),
+                "name": getattr(r, "name", ""),
+                "first_date": getattr(r, "first_date", pd.NaT),
+                "last_date": getattr(r, "last_date", pd.NaT),
+                "is_delisted_guess": bool(getattr(r, "is_delisted_guess", False)),
+            }
+        return out
+
+
+# =============================================================================
+# Dataset memmap store (keyed safely)
+# =============================================================================
+class _MemmapStore:
+    @staticmethod
+    def _dir() -> str:
+        d = os.path.join(str(DataProvider._cfg("OUTPUT_DIR", "./output")), "dataset_store")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @staticmethod
+    def _feature_hash(feature_cols: List[str]) -> str:
+        raw = ",".join(feature_cols).encode("utf-8")
+        return hashlib.sha1(raw).hexdigest()[:10]
+
+    @classmethod
+    def key(cls, mode: str, adj_norm: str, fp: str, label_col: str, feature_cols: List[str]) -> str:
+        today = _dt.date.today().strftime("%Y%m%d")
+        fh = cls._feature_hash(feature_cols)
+        return f"{mode}_{adj_norm}_{today}_{DataProvider.VERSION}_{fp}_{label_col}_{fh}"
+
+    @classmethod
+    def paths(cls, key: str) -> Dict[str, str]:
+        base = os.path.join(cls._dir(), key)
+        os.makedirs(base, exist_ok=True)
+        return {
+            "base": base,
+            "meta": os.path.join(base, "meta.json"),
+            "features": os.path.join(base, "features.f32.bin"),
+            "labels": os.path.join(base, "labels.f32.bin"),
+            "dates": os.path.join(base, "dates.i8.bin"),
+            "code_ids": os.path.join(base, "code_ids.i4.bin"),
+        }
+
+    @classmethod
+    def exists(cls, key: str) -> bool:
+        p = cls.paths(key)
+        need = ["meta", "features", "labels", "dates", "code_ids"]
+        return all(os.path.exists(p[k]) and os.path.getsize(p[k]) >= 512 for k in need)
+
+    @classmethod
+    def build(cls, panel_df: pd.DataFrame, feature_cols: List[str], label_col: str, key: str) -> Dict[str, Any]:
+        p = cls.paths(key)
+        panel_df = panel_df.sort_values(["code", "date"]).reset_index(drop=True)
+        panel_df["date"] = pd.to_datetime(panel_df["date"], errors="coerce")
+        panel_df = panel_df.dropna(subset=["date"]).reset_index(drop=True)
+
+        n = int(len(panel_df))
+        fdim = int(len(feature_cols))
+        if n <= 0 or fdim <= 0:
+            raise ValueError("Empty panel_df or feature_cols.")
+
+        cat = pd.Categorical(panel_df["code"].astype(str))
+        code_ids = cat.codes.astype(np.int32, copy=False)
+        code_vocab = [str(x) for x in cat.categories.tolist()]
+
+        dates_i8 = panel_df["date"].values.astype("datetime64[ns]").astype(np.int64)
+
+        feat_mm = np.memmap(p["features"], mode="w+", dtype=np.float32, shape=(n, fdim))
+        lab_mm = np.memmap(p["labels"], mode="w+", dtype=np.float32, shape=(n,))
+        date_mm = np.memmap(p["dates"], mode="w+", dtype=np.int64, shape=(n,))
+        cid_mm = np.memmap(p["code_ids"], mode="w+", dtype=np.int32, shape=(n,))
+
+        cid_mm[:] = code_ids
+        date_mm[:] = dates_i8
+
+        lab = pd.to_numeric(panel_df[label_col], errors="coerce").fillna(0.0).astype(np.float32).values
+        lab_mm[:] = lab
+
+        chunk = int(DataProvider._cfg("MEMMAP_WRITE_CHUNK", 250_000))
+        for st in range(0, n, chunk):
+            ed = min(n, st + chunk)
+            feat_mm[st:ed, :] = panel_df.loc[st:ed - 1, feature_cols].astype(np.float32).values
+
+        feat_mm.flush()
+        lab_mm.flush()
+        date_mm.flush()
+        cid_mm.flush()
+
+        meta = {
+            "key": key,
+            "n": n,
+            "fdim": fdim,
+            "feature_cols": feature_cols,
+            "label_col": label_col,
+            "code_vocab": code_vocab,
+            "created_at_utc": _dt.datetime.utcnow().isoformat(),
+        }
+        DataProvider._atomic_save_json(meta, p["meta"])
+        return meta
+
+    @classmethod
+    def open(cls, key: str) -> Tuple[Dict[str, Any], Dict[str, np.memmap]]:
+        p = cls.paths(key)
+        with open(p["meta"], "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        n = int(meta["n"])
+        fdim = int(meta["fdim"])
+        mms = {
+            "features": np.memmap(p["features"], mode="r", dtype=np.float32, shape=(n, fdim)),
+            "labels": np.memmap(p["labels"], mode="r", dtype=np.float32, shape=(n,)),
+            "dates": np.memmap(p["dates"], mode="r", dtype=np.int64, shape=(n,)),
+            "code_ids": np.memmap(p["code_ids"], mode="r", dtype=np.int32, shape=(n,)),
+        }
+        return meta, mms
+
+
+# =============================================================================
+# Worker init for ProcessPool (avoid pickling big maps each task)
+# =============================================================================
+_G_META_MAP: Optional[Dict[str, Dict[str, Any]]] = None
+_G_SECMASTER_MAP: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+def _worker_init(meta_map: Dict[str, Dict[str, Any]], sec_map: Dict[str, Dict[str, Any]]) -> None:
+    global _G_META_MAP, _G_SECMASTER_MAP
+    _G_META_MAP = meta_map
+    _G_SECMASTER_MAP = sec_map
+
+
+def _process_one_code_file_worker(price_file: str, mode: str, adjust: str) -> Optional[pd.DataFrame]:
+    mm = _G_META_MAP or {}
+    sm = _G_SECMASTER_MAP or {}
+    return DataProvider._process_one_code_file(price_file, mode, adjust, mm, sm)
+
+
+# =============================================================================
+# QC (hard contracts, explicit rejection)
+# =============================================================================
+class _QC:
+    @staticmethod
+    def validate_price_frame(df: pd.DataFrame) -> Tuple[bool, str]:
+        need_cols = ["code", "date", "open", "high", "low", "close"]
+        for c in need_cols:
+            if c not in df.columns:
+                return False, f"MissingCol({c})"
+
+        # code/date clean
+        if df["code"].isna().any():
+            return False, "BadCode(NaN)"
+        if df["date"].isna().any():
+            return False, "BadDate(NaT)"
+
+        # monotonic per code, duplicates not allowed
+        g = df.groupby("code", sort=False)
+        dup = g["date"].apply(lambda x: x.duplicated().any())
+        if bool(dup.any()):
+            return False, "DupDate"
+
+        # sanity ranges
+        for c in ["open", "high", "low", "close"]:
+            s = pd.to_numeric(df[c], errors="coerce")
+            if s.isna().mean() > 0.1:
+                return False, f"TooManyNaN({c})"
+            if (s <= 0).mean() > 0.01:
+                return False, f"NonPositive({c})"
+
+        # OHLC consistency
+        oh = np.maximum(df["open"].astype(float), df["close"].astype(float))
+        ol = np.minimum(df["open"].astype(float), df["close"].astype(float))
+        if ((df["high"].astype(float) + 1e-9) < oh).mean() > 0.001:
+            return False, "OHLCHighInconsistent"
+        if ((df["low"].astype(float) - 1e-9) > ol).mean() > 0.001:
+            return False, "OHLCLowInconsistent"
+        return True, "OK"
+
+
+# =============================================================================
+# Core Provider
+# =============================================================================
+class DataProvider:
+    VERSION = "v23"
+
+    # -------------------------------
+    # Utilities
+    # -------------------------------
+    @staticmethod
+    def _cfg(name: str, default: Any) -> Any:
+        return getattr(Config, name, default)
+
+    @staticmethod
+    def _norm_adjust(adjust: Optional[str]) -> str:
+        if adjust is None:
+            return "raw"
+        a = str(adjust).strip().lower()
+        if a in ("", "raw", "none", "null", "nan"):
+            return "raw"
+        if a == "qfq":
+            return "qfq"
+        if a == "hfq":
+            return "hfq"
+        raise ValueError(f"Unknown adjust={adjust!r}. Use raw/qfq/hfq")
+
+    @staticmethod
+    def _ak_adjust_param(adj_norm: str):
+        return "" if adj_norm == "raw" else adj_norm
+
+    @staticmethod
+    def _yyyymmdd(dt: pd.Timestamp) -> str:
+        return pd.to_datetime(dt).strftime("%Y%m%d")
+
+    @staticmethod
+    def _atomic_save_bytes(data: bytes, path: str) -> None:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        if os.name == "nt" and os.path.exists(path):
+            os.remove(path)
+        os.replace(tmp, path)
+
+    @staticmethod
+    def _atomic_save_json(obj: Dict[str, Any], path: str) -> None:
+        DataProvider._atomic_save_bytes(json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8"), path)
+
+    @staticmethod
+    def _atomic_save_parquet(df: pd.DataFrame, path: str, index: bool) -> None:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        kwargs = {}
+        comp = DataProvider._cfg("PARQUET_COMPRESSION", "zstd")
+        if comp:
+            kwargs["compression"] = comp
+        try:
+            df.to_parquet(tmp, engine="pyarrow", index=index, **kwargs)
+        except Exception:
+            df.to_parquet(tmp, index=index)
+        if os.name == "nt" and os.path.exists(path):
+            os.remove(path)
+        os.replace(tmp, path)
+
+    @staticmethod
+    def _setup_proxy_env() -> None:
+        # Always set env proxy if provided (even with VPN rotator enabled)
+        proxy = str(DataProvider._cfg("PROXY_URL", "") or "").strip()
+        if proxy:
+            os.environ["http_proxy"] = proxy
+            os.environ["https_proxy"] = proxy
+        if bool(DataProvider._cfg("USE_VPN_ROTATOR", False)):
+            if vpn_rotator:
+                logger.info("🛡️ VPN Rotator enabled.")
+            else:
+                logger.warning("⚠️ USE_VPN_ROTATOR=True but vpn_rotator missing.")
+
+    # -------------------------------
+    # Price paths
+    # -------------------------------
+    @staticmethod
+    def _meta_path(price_path: str) -> str:
+        return price_path + ".meta.json"
+
+    @staticmethod
+    def _price_dir(adj_norm: str) -> str:
+        root = str(DataProvider._cfg("DATA_DIR", "./data"))
+        return os.path.join(root, f"price_{adj_norm}")
+
+    @staticmethod
+    def _legacy_price_dirs(adj_norm: str) -> List[str]:
+        root = str(DataProvider._cfg("DATA_DIR", "./data"))
+        cands: List[str] = []
+        if adj_norm == "qfq":
+            cands.append(root)
+        cands.append(os.path.join(root, "price"))
+        return [d for d in cands if os.path.isdir(d)]
+
+    @staticmethod
+    def _price_path(adj_norm: str, code: str) -> str:
+        d = DataProvider._price_dir(adj_norm)
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, f"{code}.parquet")
+
+    @staticmethod
+    def _price_glob(adj_norm: str) -> List[str]:
+        d = DataProvider._price_dir(adj_norm)
+        files = sorted(glob.glob(os.path.join(d, "*.parquet")))
+        if files:
+            return files
+        for ld in DataProvider._legacy_price_dirs(adj_norm):
+            files = sorted(glob.glob(os.path.join(ld, "*.parquet")))
+            if files:
+                logger.warning(f"[v23] Using legacy price dir for adjust={adj_norm}: {ld}")
+                return files
+        return []
+
+    # -------------------------------
+    # AkShare wrappers
+    # -------------------------------
+    @staticmethod
+    def _ak_hist(code: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp, adjust: str) -> pd.DataFrame:
+        adj_norm = DataProvider._norm_adjust(adjust)
+        start = DataProvider._yyyymmdd(start_dt)
+        end = DataProvider._yyyymmdd(end_dt)
+        tries = ["", None] if adj_norm == "raw" else [adj_norm]
+        last_e: Optional[Exception] = None
+        for t in tries:
+            try:
+                return _AkClient.call(
+                    ak.stock_zh_a_hist,
+                    symbol=code,
+                    period="daily",
+                    start_date=start,
+                    end_date=end,
+                    adjust=t,
+                )
+            except Exception as e:
+                last_e = e
+        raise last_e  # type: ignore
+
+    # -------------------------------
+    # Price normalization
+    # -------------------------------
+    @staticmethod
+    def _normalize_price_df(df: pd.DataFrame) -> pd.DataFrame:
+        rename_map = {
+            "日期": "date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "成交额": "amount",
+            "换手率": "turnover",
+        }
+        df = df.rename(columns=rename_map).copy()
+        if "date" not in df.columns:
+            df = df.reset_index().rename(columns={"index": "date"})
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date")
+
+        keep = [c for c in ["date", "open", "high", "low", "close", "volume", "amount", "turnover"] if c in df.columns]
+        df = df[keep].copy()
+
+        for c in ["open", "high", "low", "close", "volume", "amount", "turnover"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        # enforce float32 where meaningful
+        for c in ["open", "high", "low", "close", "volume", "amount", "turnover"]:
+            if c in df.columns:
+                df[c] = df[c].astype(np.float32, copy=False)
+
+        # drop non-positive close
+        if "close" in df.columns:
+            df = df[df["close"] > 0].copy()
+        return df
+
+    # -------------------------------
+    # Meta-guarded read
+    # -------------------------------
+    @staticmethod
+    def _read_price(price_file: str, expected_adj: Optional[str] = None) -> Optional[pd.DataFrame]:
+        try:
+            df = pd.read_parquet(price_file)
+            if df is None or df.empty:
+                return None
+
+            code = _normalize_code(os.path.basename(price_file).replace(".parquet", ""))
+            if not code:
+                return None
+            if "code" not in df.columns:
+                df["code"] = code
+
+            df["code"] = _norm_code_series(df["code"])
+            df = df.dropna(subset=["code"])
+            df["code"] = df["code"].astype(str)
+
+            if "date" not in df.columns:
+                return None
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"]).sort_values(["code", "date"]).reset_index(drop=True)
+
+            if expected_adj is not None:
+                exp = DataProvider._norm_adjust(expected_adj)
+                meta_path = DataProvider._meta_path(price_file)
+                strict = bool(DataProvider._cfg("STRICT_PRICE_META", True))
+                allow_legacy = bool(DataProvider._cfg("ALLOW_LEGACY_PRICE_CACHE", False))
+                if os.path.exists(meta_path):
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    stored = DataProvider._norm_adjust(meta.get("stored_adjust"))
+                    if stored != exp:
+                        logger.error(f"[CORRUPT] {price_file} stored={stored} expected={exp}. Skipping.")
+                        return None
+                else:
+                    if strict and (not allow_legacy) and exp != "raw":
+                        logger.error(
+                            f"[NO_META] {os.path.basename(price_file)} rejected. Expected {exp} but no meta found. "
+                            f"Hint: set ALLOW_LEGACY_PRICE_CACHE=True for old data."
+                        )
+                        return None
+            return df
+        except Exception as e:
+            logger.debug(f"_read_price failed: {price_file} err={e}")
+            return None
+
+    # -------------------------------
+    # Freshness skip
+    # -------------------------------
+    @staticmethod
+    def _should_skip_fetch(last_dt: Optional[pd.Timestamp], updated_at: Optional[pd.Timestamp], target_dt: pd.Timestamp) -> bool:
+        if not bool(DataProvider._cfg("SKIP_IF_FRESH", True)):
+            return False
+        if last_dt is None:
+            return False
+        lag_days = int(DataProvider._cfg("FRESH_LAG_DAYS", 0))
+        if pd.Timestamp(last_dt).normalize() < (pd.Timestamp(target_dt).normalize() - pd.Timedelta(days=lag_days)):
+            return False
+        if updated_at is not None and pd.Timestamp(updated_at).normalize() >= pd.Timestamp(_dt.date.today()).normalize():
+            return True
+        return True
+
+    # -------------------------------
+    # Download incremental
+    # -------------------------------
+    @staticmethod
+    def _download_price_incremental(
+        code: str,
+        adjust: str,
+        target_dt: pd.Timestamp,
+        manifest_map: Dict[Tuple[str, str], Tuple[Optional[pd.Timestamp], int, Optional[pd.Timestamp]]],
+    ) -> Tuple[str, str, bool, str, Optional[pd.Timestamp], int]:
+        code = _normalize_code(code) or str(code)
+        adj_norm = DataProvider._norm_adjust(adjust)
+        schema_ver = int(DataProvider._cfg("PRICE_SCHEMA_VER", 2))
+        path = DataProvider._price_path(adj_norm, code)
+
+        last_dt, rows_hint, updated_at = (None, 0, None)
+        key = (code, adj_norm)
+        if key in manifest_map:
+            last_dt, rows_hint, updated_at = manifest_map.get(key, (None, 0, None))
+            last_dt = pd.to_datetime(last_dt, errors="coerce") if last_dt is not None else None
+
+        if DataProvider._should_skip_fetch(last_dt, updated_at, target_dt):
+            return code, adj_norm, True, "SkipFresh", last_dt, int(rows_hint)
+
+        if last_dt is None and os.path.exists(path) and os.path.getsize(path) > 512:
+            old_df = DataProvider._read_price(path, expected_adj=adj_norm)
+            if old_df is not None and not old_df.empty:
+                last_dt = pd.to_datetime(old_df["date"], errors="coerce").max()
+
+        if last_dt is None:
+            years = int(DataProvider._cfg("PRICE_BACKFILL_YEARS", 10))
+            start_dt = pd.Timestamp(target_dt) - pd.Timedelta(days=365 * years)
+        else:
+            overlap = int(DataProvider._cfg("PRICE_OVERLAP_DAYS", 3))
+            start_dt = pd.Timestamp(last_dt) - pd.Timedelta(days=overlap)
+
+        try:
+            raw = DataProvider._ak_hist(code, start_dt, pd.Timestamp(target_dt), adjust=adj_norm)
+        except Exception as e:
+            if os.path.exists(path) and os.path.getsize(path) > 512:
+                return code, adj_norm, True, f"UsingCache({type(e).__name__})", last_dt, int(rows_hint)
+            return code, adj_norm, False, f"FetchFail({type(e).__name__}:{e})", last_dt, 0
+
+        if raw is None or raw.empty:
+            return code, adj_norm, True, "NoNewRows", last_dt, int(rows_hint)
+
+        df_new = DataProvider._normalize_price_df(raw)
+        df_new["code"] = code
+
+        df_old = None
+        if os.path.exists(path) and os.path.getsize(path) > 512:
+            df_old = DataProvider._read_price(path, expected_adj=adj_norm)
+
+        if df_old is not None and not df_old.empty:
+            merged = pd.concat([df_old, df_new], ignore_index=True)
+            merged["date"] = pd.to_datetime(merged["date"], errors="coerce")
+            merged = merged.dropna(subset=["date"]).sort_values(["code", "date"])
+            merged = merged.drop_duplicates(["code", "date"], keep="last").reset_index(drop=True)
+        else:
+            merged = df_new.drop_duplicates(["code", "date"], keep="last").reset_index(drop=True)
+
+        DataProvider._atomic_save_parquet(merged, path, index=False)
+        DataProvider._atomic_save_json(
+            {
+                "schema_ver": schema_ver,
+                "created_by": DataProvider.VERSION,
+                "code": code,
+                "stored_adjust": adj_norm,
+                "ak_adjust": DataProvider._ak_adjust_param(adj_norm),
+                "updated_at_utc": _dt.datetime.utcnow().isoformat(),
+                "rows": int(len(merged)),
+                "last_date": pd.to_datetime(merged["date"]).max().isoformat() if len(merged) else None,
+            },
+            DataProvider._meta_path(path),
+        )
+
+        last = pd.to_datetime(merged["date"]).max() if len(merged) else last_dt
+        return code, adj_norm, True, "OK", last, int(len(merged))
+
+    # =============================================================================
+    # ETL Entry (external interface unchanged)
+    # =============================================================================
+    @staticmethod
+    def download_data(adjusts: Optional[List[str]] = None) -> None:
+        logger.info(f"\n{'=' * 60}\n>>> [ETL] Data Pipeline Initiated ({DataProvider.VERSION})\n{'=' * 60}")
+        DataProvider._setup_proxy_env()
+        os.makedirs(str(DataProvider._cfg("DATA_DIR", "./data")), exist_ok=True)
+
+        target_dt = _CalendarStore.latest_trade_date()
+        logger.info(f"📅 Target trading date = {target_dt.date()}")
+
+        if adjusts is None:
+            adjusts = DataProvider._cfg("PRICE_ADJUSTS", ["qfq"])
+        adjusts = [DataProvider._norm_adjust(a) for a in adjusts]
+
+        logger.info("📋 Building universe snapshot (normalized + historical-complete union)...")
+        snap = _UniverseStore.get_snapshot(target_dt, force_refresh=bool(DataProvider._cfg("FORCE_UNIVERSE_REFRESH", False)))
+        codes = snap["code"].astype(str).tolist() if snap is not None and not snap.empty else []
+        if not codes:
+            logger.critical("❌ Universe is empty. Abort.")
+            return
+        logger.info(f"✅ Universe size = {len(codes)}")
+
+        mstore = ManifestStore(os.path.join(str(DataProvider._cfg("DATA_DIR", "./data")), "manifest", "price_manifest.parquet"))
+        manifest_map = ManifestStore.to_map(mstore.load())
+
+        todo = [(c, a) for c in codes for a in adjusts]
+
+        def _task(args):
+            c, a = args
+            return DataProvider._download_price_incremental(c, a, target_dt=target_dt, manifest_map=manifest_map)
+
+        workers = int(DataProvider._cfg("PRICE_WORKERS", min(24, (os.cpu_count() or 8) + 8)))
+        updates: List[ManifestRow] = []
+        ok = 0
+        bad = 0
+
+        logger.info(f"🚀 Starting price download with {workers} workers... (todo={len(todo)})")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            for code, adj, succ, msg, last_dt, rows in tqdm(ex.map(_task, todo), total=len(todo), desc="Downloading"):
+                if succ:
+                    ok += 1
+                    updates.append(
+                        ManifestRow(
+                            code=code,
+                            adjust=adj,
+                            last_date=last_dt,
+                            rows=int(rows),
+                            updated_at=pd.Timestamp.utcnow(),
+                            schema_ver=int(DataProvider._cfg("PRICE_SCHEMA_VER", 2)),
+                        )
+                    )
+                else:
+                    bad += 1
+                    logger.warning(f"[Price] {code}/{adj} failed: {msg}")
+
+        mstore.upsert_many(updates)
+        logger.info(f"✅ Price update done. OK={ok} Bad={bad}")
+
+        # Optional fundamentals (unchanged behavior)
+        if bool(DataProvider._cfg("SYNC_FUNDAMENTAL", False)):
+            logger.info("📋 Syncing Fundamental Data...")
+            fin_workers = int(DataProvider._cfg("FIN_WORKERS", 8))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=fin_workers) as ex:
+                futures = {ex.submit(DataProvider._download_finance_worker, c): c for c in codes}
+                for fut in tqdm(concurrent.futures.as_completed(futures), total=len(codes), desc="Finance"):
+                    code, succ, msg = fut.result()
+                    if not succ:
+                        logger.warning(f"[Fund] {code} failed: {msg}")
+
+        logger.info("✅ ETL Pipeline Completed.")
 
     @staticmethod
     def _download_finance_worker(code: str) -> Tuple[str, bool, str]:
-        """财务数据下载器 (智能缓存)"""
-        fund_dir = os.path.join(Config.DATA_DIR, "fundamental")
+        code = _normalize_code(code) or str(code)
+        fund_dir = os.path.join(str(DataProvider._cfg("DATA_DIR", "./data")), "fundamental")
         os.makedirs(fund_dir, exist_ok=True)
         path = os.path.join(fund_dir, f"{code}.parquet")
 
-        # --- Smart Seasonality Logic ---
-        if os.path.exists(path):
-            mtime = os.path.getmtime(path)
-            curr_month = datetime.date.today().month
-            # 财报月(4,8,10)缓存12小时，平时缓存3天
-            ttl_seconds = 12 * 3600 if curr_month in [4, 8, 10] else 72 * 3600
+        curr_month = _dt.date.today().month
+        ttl_seconds = 12 * 3600 if curr_month in [4, 8, 10] else 72 * 3600
 
-            if (time.time() - mtime) < ttl_seconds:
-                return code, True, "Skipped (Cache)"
+        if os.path.exists(path) and os.path.getsize(path) > 512 and (time.time() - os.path.getmtime(path)) < ttl_seconds:
+            return code, True, "Skipped(Cache)"
 
-        for attempt in range(2):
-            try:
-                time.sleep(random.uniform(0.1, 0.5))
-                df = ak.stock_financial_analysis_indicator_em(symbol=code)
-                if df is None or df.empty: return code, True, "Empty"
+        try:
+            df = _AkClient.call(ak.stock_financial_analysis_indicator, symbol=code)
+        except Exception as e:
+            return code, False, f"FetchFail({type(e).__name__}:{e})"
 
-                df['date'] = pd.to_datetime(df['日期'])
+        try:
+            if df is None or df.empty:
+                return code, True, "Empty"
 
-                col_map = {
-                    '加权净资产收益率': 'roe', '主营业务收入增长率(%)': 'rev_growth',
-                    '净利润增长率(%)': 'profit_growth', '资产负债率(%)': 'debt_ratio',
-                    '市盈率(动态)': 'pe_ttm', '市净率': 'pb'
-                }
-                valid_cols = [c for c in col_map.keys() if c in df.columns]
-                df = df[['date'] + valid_cols].copy()
-                df.rename(columns=col_map, inplace=True)
+            if "date" not in df.columns:
+                for c in ["公告日期", "披露日期", "报告期", "报告日期", "日期"]:
+                    if c in df.columns:
+                        df = df.rename(columns={c: "date"})
+                        break
+            if "date" not in df.columns:
+                df = df.reset_index().rename(columns={"index": "date"})
 
-                for c in df.columns:
-                    if c != 'date':
-                        df[c] = pd.to_numeric(df[c], errors='coerce').astype(np.float32)
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"]).sort_values("date")
 
-                df.set_index('date', inplace=True)
-                df.sort_index(inplace=True)
+            keep = ["date"]
+            for c in df.columns:
+                if c == "date":
+                    continue
+                if pd.api.types.is_numeric_dtype(df[c]):
+                    keep.append(c)
+                else:
+                    s = pd.to_numeric(df[c], errors="coerce")
+                    if s.notna().mean() > 0.9:
+                        df[c] = s
+                        keep.append(c)
 
-                DataProvider._atomic_save(df, path)
-                return code, True, "Success"
-            except:
-                DataProvider._safe_switch_vpn()
-        return code, False, "Failed"
+            DataProvider._atomic_save_parquet(df[keep].copy(), path, index=False)
+            return code, True, "OK"
+        except Exception as e:
+            return code, False, f"ParseFail({type(e).__name__}:{e})"
 
-    # ==========================================================================
-    # 3. ETL 主流程 (Pipeline)
-    # ==========================================================================
+    # =============================================================================
+    # Meta attach + masks + target closure (核心升级)
+    # =============================================================================
+    @staticmethod
+    def _attach_code_meta(
+        df: pd.DataFrame,
+        meta_map: Dict[str, Dict[str, Any]],
+        sec_map: Dict[str, Dict[str, Any]],
+    ) -> pd.DataFrame:
+        code = _normalize_code(df["code"].iloc[0]) or str(df["code"].iloc[0])
+        m = meta_map.get(code, {})
+        s = sec_map.get(code, {})
+
+        name = str(m.get("name", s.get("name", "")))
+        board = str(m.get("board", s.get("board", _CodeMeta.infer_board(code))))
+        is_st = bool(m.get("is_st", _CodeMeta.is_st(name)))
+
+        limit_rate = float(m.get("limit_rate", _CodeMeta.limit_rate(board, is_st)))
+
+        out = df.copy()
+        out["code"] = _norm_code_series(out["code"])
+        out = out.dropna(subset=["code"]).copy()
+        out["code"] = out["code"].astype(str)
+        out["board"] = board
+        out["is_st"] = bool(is_st)
+        out["limit_rate"] = float(limit_rate)
+        out["name"] = name
+
+        # security master inferred fields (help analysis / filtering)
+        out["first_date_hint"] = s.get("first_date", pd.NaT)
+        out["last_date_hint"] = s.get("last_date", pd.NaT)
+        out["is_delisted_guess"] = bool(s.get("is_delisted_guess", False))
+        return out
 
     @staticmethod
-    def download_data():
-        """ETL Entry Point"""
-        print(f"\n{'=' * 60}\n>>> [ETL] Data Pipeline Initiated\n{'=' * 60}")
-        DataProvider._setup_proxy_env()
-        os.makedirs(Config.DATA_DIR, exist_ok=True)
+    def _align_to_calendar(df: pd.DataFrame) -> pd.DataFrame:
+        """Optional: align each code to full trade calendar between min/max to avoid irregular gaps."""
+        if not bool(DataProvider._cfg("ALIGN_TO_CALENDAR", False)):
+            return df
+        cal = _CalendarStore.get_trade_dates()
+        df = df.sort_values(["code", "date"]).copy()
+        out_parts: List[pd.DataFrame] = []
+        for code, g in df.groupby("code", sort=False):
+            g = g.copy()
+            dmin, dmax = pd.to_datetime(g["date"]).min(), pd.to_datetime(g["date"]).max()
+            idx = cal[(cal >= dmin) & (cal <= dmax)]
+            base = g.set_index("date")
+            base.index = pd.to_datetime(base.index, errors="coerce")
+            base = base[~base.index.isna()]
+            base = base[~base.index.duplicated(keep="last")].sort_index()
+            base = base.reindex(idx)
+            base["code"] = code
+            base = base.reset_index().rename(columns={"index": "date"})
+            out_parts.append(base)
+        out = pd.concat(out_parts, ignore_index=True)
+        return out
 
-        # 1. Sync List
+    @staticmethod
+    def _add_liquidity_features(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.sort_values(["code", "date"]).copy()
+        # dollar volume
+        if "amount" in df.columns:
+            dv = df["amount"].fillna(0.0)
+        else:
+            dv = df["close"].fillna(0.0) * df.get("volume", 0.0).fillna(0.0)
+        df["dollar_vol"] = dv.astype(np.float32)
+
+        # ADV20 (for participation constraints later)
+        g = df.groupby("code", sort=False)
+        df["adv20"] = g["dollar_vol"].transform(lambda x: x.rolling(20, min_periods=1).mean()).astype(np.float32)
+        return df
+
+    @staticmethod
+    def _add_trade_masks(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Create:
+        - tradable_mask: base tradability (new listing, suspended, illiquid, tiny price)
+        - buyable_mask: additionally filters out one-word limit-up days (can't buy)
+        - sellable_mask: filters out one-word limit-down days (can't sell)
+        """
+        df = df.sort_values(["code", "date"]).copy()
+        g = df.groupby("code", sort=False)
+
+        list_days = g.cumcount() + 1
+        prev_close = g["close"].shift(1)
+        pct_chg = df["close"] / (prev_close + 1e-9) - 1.0
+
+        min_list_days = int(DataProvider._cfg("MIN_LIST_DAYS", 60))
+        min_dv = float(DataProvider._cfg("MIN_DOLLAR_VOL_FOR_TRADE", 1e6))
+        min_price = float(DataProvider._cfg("MIN_PRICE", 1.0))
+
+        lr = pd.to_numeric(df.get("limit_rate", np.nan), errors="coerce").fillna(float(DataProvider._cfg("LIMIT_RATE_MAIN", 0.10)))
+        eps = float(DataProvider._cfg("LIMIT_EPS", 0.002))
+
+        # basic noise conditions
+        cond_new = list_days < min_list_days
+        cond_suspended = df.get("volume", 0.0).fillna(0.0) <= 0
+        cond_illiquid = df.get("dollar_vol", 0.0).fillna(0.0) < min_dv
+        cond_tiny_price = df["close"].fillna(0.0) < min_price
+
+        base_noise = cond_new | cond_suspended | cond_illiquid | cond_tiny_price
+        df["tradable_mask"] = np.where(base_noise, np.nan, 1.0).astype(np.float32)
+
+        # one-word limit detection
+        oneword = pd.Series(False, index=df.index)
+        if {"high", "low"}.issubset(df.columns):
+            oneword = np.isclose(df["high"].astype(float), df["low"].astype(float), rtol=0.0, atol=1e-6)
+
+        limit_up = (pct_chg >= (lr - 1e-4)) | (pct_chg >= (lr - eps))
+        limit_dn = (pct_chg <= -(lr - 1e-4)) | (pct_chg <= -(lr - eps))
+
+        # if one-word & at limit => cannot trade on that side
+        cond_buy_block = oneword & limit_up
+        cond_sell_block = oneword & limit_dn
+
+        df["buyable_mask"] = df["tradable_mask"].copy()
+        df.loc[cond_buy_block, "buyable_mask"] = np.nan
+
+        df["sellable_mask"] = df["tradable_mask"].copy()
+        df.loc[cond_sell_block, "sellable_mask"] = np.nan
+
+        # Also require open/close availability for buy/sell
+        df.loc[df["open"].isna() | (df["open"] <= 0), "buyable_mask"] = np.nan
+        df.loc[df["close"].isna() | (df["close"] <= 0), "sellable_mask"] = np.nan
+
+        return df
+
+    @staticmethod
+    def _tag_universe(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.sort_values(["code", "date"]).copy()
+        df["list_days_count"] = df.groupby("code")["date"].cumcount() + 1
+        cond_vol = df.get("volume", 0.0).fillna(0.0) > 0
+        cond_price = df["close"].fillna(0.0) >= float(DataProvider._cfg("UNIVERSE_MIN_PRICE", 2.0))
+        cond_list = df["list_days_count"] > int(DataProvider._cfg("UNIVERSE_MIN_LIST_DAYS", 60))
+        df["is_universe"] = (cond_vol & cond_price & cond_list).astype(bool)
+        df.drop(columns=["list_days_count"], inplace=True)
+        return df
+
+    # =============================================================================
+    # Fundamentals PIT merge (unchanged behavior, optional)
+    # =============================================================================
+    @staticmethod
+    def _fund_path(code: str) -> str:
+        return os.path.join(str(DataProvider._cfg("DATA_DIR", "./data")), "fundamental", f"{code}.parquet")
+
+    @staticmethod
+    def _merge_fundamental_pit(price_df: pd.DataFrame) -> pd.DataFrame:
+        if not bool(DataProvider._cfg("USE_FUNDAMENTAL", False)):
+            return price_df
+        code = _normalize_code(price_df["code"].iloc[0]) or str(price_df["code"].iloc[0])
+        fp = DataProvider._fund_path(code)
+        if not os.path.exists(fp) or os.path.getsize(fp) < 512:
+            return price_df
         try:
-            print("☁️ Syncing Universe List...")
-            stock_info = ak.stock_zh_a_spot_em()
-            codes = stock_info['代码'].tolist()
-        except Exception as e:
-            print(f"❌ Critical Error: Failed to fetch stock list. {e}")
-            return
+            f = pd.read_parquet(fp)
+        except Exception:
+            return price_df
+        if f is None or f.empty:
+            return price_df
 
-        target_date = DataProvider._get_latest_trading_date()
-        print(f"📅 Target Trading Date: {target_date}")
+        if "date" not in f.columns:
+            f = f.reset_index().rename(columns={"index": "date"})
+        f["date"] = pd.to_datetime(f["date"], errors="coerce")
+        f = f.dropna(subset=["date"]).sort_values("date")
 
-        # 2. Parallel Probe (Deep Integrity Scan)
-        print("🔍 Probing Local Data Integrity...")
+        eff = None
+        eff_col = None
+        for c in ["pub_date", "公告日期", "披露日期", "发布日期", "公告日"]:
+            if c in f.columns:
+                eff = pd.to_datetime(f[c], errors="coerce")
+                eff_col = c
+                break
 
-        def _check_task(c):
-            fpath = os.path.join(Config.DATA_DIR, f"{c}.parquet")
-            if not DataProvider._is_data_fresh(fpath, target_date):
-                return c
+        if eff is not None:
+            f = f.copy()
+            f["_eff_date"] = eff
+            f = f.dropna(subset=["_eff_date"]).sort_values("_eff_date")
+            drop_cols = [c for c in ["date", eff_col] if c in f.columns]
+            right = f.drop(columns=drop_cols).rename(columns={"_eff_date": "date"})
+        else:
+            right = f
+
+        num_cols: List[str] = []
+        for c in right.columns:
+            if c == "date":
+                continue
+            if pd.api.types.is_numeric_dtype(right[c]):
+                num_cols.append(c)
+            else:
+                s = pd.to_numeric(right[c], errors="coerce")
+                if s.notna().mean() > 0.9:
+                    right[c] = s
+                    num_cols.append(c)
+        if not num_cols:
+            return price_df
+
+        left = price_df.sort_values("date").copy()
+        right2 = right[["date"] + num_cols].sort_values("date")
+        return pd.merge_asof(left, right2, on="date", direction="backward")
+
+    # =============================================================================
+    # Factor worker (per code) with execution-closed labels
+    # =============================================================================
+    @staticmethod
+    def _process_one_code_file(
+        price_file: str,
+        mode: str,
+        adjust: str,
+        meta_map: Dict[str, Dict[str, Any]],
+        sec_map: Dict[str, Dict[str, Any]],
+    ) -> Optional[pd.DataFrame]:
+        adj_norm = DataProvider._norm_adjust(adjust)
+
+        df = DataProvider._read_price(price_file, expected_adj=adj_norm)
+        if df is None or df.empty:
             return None
 
-        scan_workers = min(os.cpu_count() * 4, 64)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=scan_workers) as executor:
-            results = list(tqdm(executor.map(_check_task, codes), total=len(codes), desc="Scanning"))
+        # normalize + attach meta
+        code = _normalize_code(df["code"].iloc[0]) or _normalize_code(os.path.basename(price_file)) or ""
+        df["code"] = code
 
-        todo_codes = [r for r in results if r is not None]
-        print(f"📊 Status: Total={len(codes)} | Fresh={len(codes) - len(todo_codes)} | Stale={len(todo_codes)}")
+        df = DataProvider._normalize_price_df(df)
+        df["code"] = code
+        df = DataProvider._attach_code_meta(df, meta_map, sec_map)
 
-        # 3. Download Execution
-        if todo_codes:
-            max_workers = 8 if len(todo_codes) < 500 else 16
-            print(f"🚀 Launching Download Engine (Workers={max_workers})...")
+        # optional calendar align
+        df = DataProvider._align_to_calendar(df)
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(DataProvider._download_price_worker, c): c for c in todo_codes}
-                success_count = 0
-                for future in tqdm(concurrent.futures.as_completed(futures), total=len(todo_codes),
-                                   desc="Downloading Price"):
-                    try:
-                        _, status, _ = future.result()
-                        if status: success_count += 1
-                    except:
-                        pass
-            print(f"✅ Price Sync Complete. Success: {success_count}/{len(todo_codes)}")
+        # earliest QC (before heavy ops)
+        ok, reason = _QC.validate_price_frame(df)
+        if not ok:
+            return None
+
+        # length check
+        context_len = int(DataProvider._cfg("CONTEXT_LEN", 60))
+        if len(df) <= context_len:
+            return None
+
+        # fundamentals PIT
+        df = DataProvider._merge_fundamental_pit(df)
+
+        # liquidity features + masks
+        df = DataProvider._add_liquidity_features(df)
+        df = DataProvider._add_trade_masks(df)
+
+        # alpha factors
+        df = df.sort_values(["code", "date"]).reset_index(drop=True)
+        df = AlphaFactory(df).make_factors()
+
+        # ---------------- label (closed-loop execution) ----------------
+        pred_len = int(DataProvider._cfg("PRED_LEN", 5))
+        g = df.groupby("code", sort=False)
+
+        # Entry price mode
+        entry_price_mode = str(DataProvider._cfg("ENTRY_PRICE_MODE", "open")).lower().strip()
+        if entry_price_mode == "open":
+            df["entry_price"] = g["open"].shift(-1)
+        elif entry_price_mode == "vwap":
+            # approximate next-day vwap = amount/volume; fallback to open
+            vwap = (df["amount"] / (df["volume"] + 1e-9)).astype(np.float32)
+            df["entry_price"] = g.apply(lambda x: vwap.loc[x.index].shift(-1)).reset_index(level=0, drop=True)
+            df["entry_price"] = df["entry_price"].fillna(g["open"].shift(-1))
+        elif entry_price_mode == "close":
+            df["entry_price"] = g["close"].shift(-1)
         else:
-            print("✅ Market Data is Up-to-Date.")
+            df["entry_price"] = g["open"].shift(-1)
 
-        # 4. Finance Sync
-        print("📋 Syncing Fundamental Data...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(DataProvider._download_finance_worker, c): c for c in codes}
-            for _ in tqdm(concurrent.futures.as_completed(futures), total=len(codes), desc="Downloading Finance"):
-                pass
+        df["future_close"] = g["close"].shift(-pred_len)
 
-        print("✅ ETL Pipeline Completed.")
+        df["target"] = df["future_close"] / (df["entry_price"] + 1e-9) - 1.0
 
-    # ==========================================================================
-    # 4. 数据加载与预处理 (Processing Layer)
-    # ==========================================================================
+        # Gate by entry feasibility (t+1 buyable) (P0)
+        gate_entry = bool(DataProvider._cfg("GATE_TARGET_WITH_ENTRY", True))
+        gate_exit = bool(DataProvider._cfg("GATE_TARGET_WITH_EXIT", False))
+
+        if gate_entry:
+            entry_ok = g["buyable_mask"].shift(-1).notna()
+            df.loc[~entry_ok, "target"] = np.nan
+
+        if gate_exit and pred_len > 0:
+            exit_ok = g["sellable_mask"].shift(-pred_len).notna()
+            df.loc[~exit_ok, "target"] = np.nan
+
+        df.loc[~np.isfinite(df["target"].astype(float)), "target"] = np.nan
+        if mode == "train":
+            df = df.dropna(subset=["target"]).reset_index(drop=True)
+
+        return df
+
+    # =============================================================================
+    # Panel build (external interface unchanged)
+    # =============================================================================
+    @staticmethod
+    def _config_fingerprint() -> str:
+        keys = DataProvider._cfg(
+            "PANEL_CACHE_FINGERPRINT_KEYS",
+            [
+                "CONTEXT_LEN",
+                "PRED_LEN",
+                "STRIDE",
+                "PRICE_SCHEMA_VER",
+                "FEATURE_PREFIXES",
+                "ALPHA_BACKEND",
+                "USE_FUNDAMENTAL",
+                "USE_CROSS_SECTIONAL",
+                "UNIVERSE_MIN_PRICE",
+                "UNIVERSE_MIN_LIST_DAYS",
+                "MIN_LIST_DAYS",
+                "MIN_DOLLAR_VOL_FOR_TRADE",
+                "MIN_PRICE",
+                "LIMIT_RATE_MAIN",
+                "LIMIT_RATE_ST",
+                "LIMIT_RATE_GEM",
+                "LIMIT_RATE_STAR",
+                "LIMIT_RATE_BSE",
+                "LIMIT_RATE_BSHARE",
+                "LIMIT_EPS",
+                "DATASET_BACKEND",
+                "INCLUDE_BSE",
+                "INCLUDE_BSHARE",
+                "GATE_TARGET_WITH_ENTRY",
+                "GATE_TARGET_WITH_EXIT",
+                "ALIGN_TO_CALENDAR",
+                "ENTRY_PRICE_MODE",
+                "DELIST_GAP_DAYS",
+            ],
+        )
+        payload: Dict[str, Any] = {"dp_ver": DataProvider.VERSION}
+        for k in keys:
+            payload[k] = getattr(Config, k, None)
+        payload["alpha_factory"] = getattr(AlphaFactory, "VERSION", None) or getattr(AlphaFactory, "__name__", "AlphaFactory")
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+        return hashlib.sha1(raw).hexdigest()[:12]
 
     @staticmethod
-    def _get_cache_path(mode):
-        today = datetime.date.today().strftime("%Y%m%d")
-        return os.path.join(Config.OUTPUT_DIR, f"panel_cache_{mode}_{today}.pkl")
+    def _cache_path(mode: str, adj_norm: str) -> str:
+        today = _dt.date.today().strftime("%Y%m%d")
+        fp = DataProvider._config_fingerprint()
+        out_dir = str(DataProvider._cfg("OUTPUT_DIR", "./output"))
+        os.makedirs(out_dir, exist_ok=True)
+        return os.path.join(out_dir, f"panel_cache_{mode}_{adj_norm}_{today}_{DataProvider.VERSION}_{fp}.pkl")
 
     @staticmethod
-    def _tag_universe(panel_df):
-        """Universe Selection Logic"""
-        print(">>> [Tagging] 标记动态股票池 (Universe Mask)...")
-        panel_df = panel_df.sort_values(['code', 'date'])
-        panel_df['list_days_count'] = panel_df.groupby('code')['date'].cumcount() + 1
+    def load_and_process_panel(
+        mode: str = "train",
+        force_refresh: bool = False,
+        adjust: str = "qfq",
+        backend: Optional[str] = None,
+        debug: bool = False,
+    ):
+        adj_norm = DataProvider._norm_adjust(adjust)
+        cache_path = DataProvider._cache_path(mode, adj_norm)
 
-        cond_vol = panel_df['volume'] > 0
-        cond_price = panel_df['close'] >= 2.0
-        cond_list = panel_df['list_days_count'] > 60
-
-        panel_df['is_universe'] = cond_vol & cond_price & cond_list
-        panel_df.drop(columns=['list_days_count'], inplace=True)
-        return panel_df
-
-    @staticmethod
-    def load_and_process_panel(mode='train', force_refresh=False):
-        """
-        Build Panel Data: Merge -> Alpha -> Label -> Norm
-        """
-        cache_path = DataProvider._get_cache_path(mode)
         if not force_refresh and os.path.exists(cache_path):
-            print(f"⚡️ [Cache Hit] Loading from {cache_path}")
             try:
-                with open(cache_path, 'rb') as f:
-                    return pickle.load(f)
-            except:
+                with open(cache_path, "rb") as f:
+                    panel_df, feat_cols = pickle.load(f)
+                if isinstance(panel_df, pd.DataFrame):
+                    panel_df.attrs.setdefault("adjust", adj_norm)
+                    panel_df.attrs.setdefault("mode", mode)
+                    panel_df.attrs.setdefault("fingerprint", DataProvider._config_fingerprint())
+                return panel_df, feat_cols
+            except Exception:
                 pass
 
-        print(f"\n>>> [Processing] Building Panel Data (Mode: {mode})...")
+        if backend is None:
+            backend = str(DataProvider._cfg("ALPHA_BACKEND", "process"))
+        backend = backend.lower().strip()
+        if debug or bool(DataProvider._cfg("DEBUG", False)):
+            backend = "serial"
 
-        # 1. Load Price
-        price_files = glob.glob(os.path.join(Config.DATA_DIR, "*.parquet"))
-        if not price_files:
-            raise RuntimeError("❌ No data found! Run `python main.py --mode download` first.")
-
-        def _read_pq(f):
-            try:
-                df = pd.read_parquet(f)
-                if df.empty: return None
-                df['code'] = os.path.basename(f).replace(".parquet", "")
-                return df
-            except:
-                return None
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, os.cpu_count() + 4)) as executor:
-            dfs = list(tqdm(executor.map(_read_pq, price_files), total=len(price_files), desc="Reading Price"))
-
-        valid_dfs = [d for d in dfs if d is not None and len(d) > Config.CONTEXT_LEN]
-        if not valid_dfs: raise ValueError("Not enough valid data.")
-
-        panel_df = pd.concat(valid_dfs, ignore_index=True)
-        if 'date' not in panel_df.columns: panel_df = panel_df.reset_index().rename(columns={'index': 'date'})
-        panel_df['date'] = pd.to_datetime(panel_df['date'])
-        panel_df['code'] = panel_df['code'].astype(str)
-
-        # Optimization: Downcast
-        f_cols = panel_df.select_dtypes(include=['float64']).columns
-        panel_df[f_cols] = panel_df[f_cols].astype(np.float32)
-
-        # 2. Merge Fundamental (PIT)
-        fund_dir = os.path.join(Config.DATA_DIR, "fundamental")
-        fund_files = glob.glob(os.path.join(fund_dir, "*.parquet"))
-
-        # --- Explicit Warning ---
-        if not fund_files:
-            print("\033[93m" + "=" * 60)
-            print("⚠️  [WARNING] MISSING FUNDAMENTAL DATA!")
-            print("   The model will lose all valuation (PE/PB) factors.")
-            print("   Please run `python main.py --mode download`.")
-            print("=" * 60 + "\033[0m")
-        else:
-            print(f"🔗 Merging Fundamental Data (PIT Mode)... Coverage: {len(fund_files)}")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-                funds = [f for f in ex.map(_read_pq, fund_files) if f is not None]
-
-            if funds:
-                fund_df = pd.concat(funds).sort_values(['code', 'date'])
-
-                # Default visibility lag: 90 days
-                fund_df['merge_date'] = fund_df['date'] + pd.Timedelta(days=90)
-                if 'pub_date' in fund_df.columns:
-                    fund_df['merge_date'] = fund_df['pub_date'].fillna(fund_df['merge_date'])
-
-                fund_df = fund_df.drop(columns=['date', 'pub_date'], errors='ignore').rename(
-                    columns={'merge_date': 'date'})
-
-                panel_df = panel_df.sort_values(['code', 'date'])
-                fund_df = fund_df.sort_values(['code', 'date'])
-
-                panel_df = pd.merge_asof(panel_df, fund_df, on='date', by='code', direction='backward')
-
-                # Keep NaN for fundamental factors here
-                fin_cols = ['roe', 'rev_growth', 'profit_growth', 'debt_ratio', 'pe_ttm', 'pb']
-                for c in fin_cols:
-                    if c in panel_df.columns:
-                        panel_df[c] = panel_df[c].astype(np.float32)
-
-        # 3. Alpha Gen (Parallel)
-        print("⚙️  Running AlphaFactory (Parallel)...")
-        panel_df.set_index('date', inplace=True)
-        panel_df = panel_df.groupby('code', group_keys=False).parallel_apply(lambda x: AlphaFactory(x).make_factors())
-        panel_df.reset_index(inplace=True)
-
-        # 4. Labeling
-        print("🏷️  Generating Labels...")
-        panel_df.sort_values(['code', 'date'], inplace=True)
-        panel_df['next_open'] = panel_df.groupby('code')['open'].shift(-1)
-        panel_df['future_close'] = panel_df.groupby('code')['close'].shift(-Config.PRED_LEN)
-        panel_df['target'] = panel_df['future_close'] / panel_df['next_open'] - 1
-
-        if mode == 'train':
-            panel_df.dropna(subset=['target'], inplace=True)
-
-        # Tag Universe
-        panel_df = DataProvider._tag_universe(panel_df)
-
-        # 5. CS Norm
-        print("🌐 Cross-Sectional Normalization...")
-        panel_df.set_index('date', inplace=True)
-        panel_df = AlphaFactory.add_cross_sectional_factors(panel_df)
-        panel_df.reset_index(inplace=True)
-
-        # 6. Final Clean
-        feat_cols = [c for c in panel_df.columns if any(c.startswith(p) for p in Config.FEATURE_PREFIXES)]
-
-        # Fill NaN with 0 for Technical Factors.
-        panel_df[feat_cols] = panel_df[feat_cols].fillna(0).replace([np.inf, -np.inf], 0).astype(np.float32)
-
-        with open(cache_path, 'wb') as f:
-            pickle.dump((panel_df, feat_cols), f)
-        print(f"✅ Panel Ready. Shape: {panel_df.shape}")
-        return panel_df, feat_cols
-
-    # ==========================================================================
-    # 5. 高性能数据集构建 (Lazy Mapping Layer)
-    # ==========================================================================
-
-    @staticmethod
-    def make_dataset(panel_df, feature_cols):
-        """
-        【Zero-Copy Lazy Dataset】
-        不再生成 Sample 对象，而是存储索引，使用 set_transform 动态切片。
-        极度节省内存，且初始化极快。
-        """
-        print(">>> [Dataset] Constructing Lazy Mapping (Zero-Copy Mode)...")
-
-        # 1. 内存锁定 (Memory Locking)
-        panel_df = panel_df.sort_values(['code', 'date']).reset_index(drop=True)
-
-        # 关键：转为 C-contiguous 内存块，这是高效切片的前提
-        print("    > Locking features into contiguous memory block...")
-        feature_matrix = np.ascontiguousarray(
-            panel_df[feature_cols].values.astype(np.float32)
+        universe_asof = _CalendarStore.latest_trade_date()
+        logger.info(
+            f">>> [Processing] Building Panel (Mode={mode}, adjust={adj_norm}, backend={backend}, universe_asof={universe_asof.date()})"
         )
 
-        if 'rank_label' in panel_df.columns:
-            target_array = panel_df['rank_label'].fillna(0.5).values.astype(np.float32)
-        else:
-            target_array = panel_df['target'].fillna(0).values.astype(np.float32)
+        # snapshot meta (asof) + security master (history inferred)
+        meta_map = _UniverseStore.meta_map_for_asof(universe_asof)
+        snap = _UniverseStore.get_snapshot(universe_asof, force_refresh=False)
+        codes = snap["code"].astype(str).tolist() if snap is not None and not snap.empty else []
+        sm_df = _SecurityMasterStore.build_or_update(
+            codes=codes,
+            adj_norm_for_scan=adj_norm,
+            target_dt=universe_asof,
+            meta_map=meta_map,
+            force=bool(DataProvider._cfg("FORCE_SECMASTER_REFRESH", False)),
+        )
+        sec_map = _SecurityMasterStore.to_map(sm_df)
 
-        # 2. 索引计算 (Valid Index Calculation)
-        universe_mask = panel_df['is_universe'].values
-        dates = panel_df['date'].values
-        codes = panel_df['code'].values
+        price_files = DataProvider._price_glob(adj_norm)
+        if not price_files:
+            raise RuntimeError(f"❌ No price data found for adjust={adj_norm}. Run download_data() first.")
 
-        # 快速向量化寻找切换点
+        if backend == "serial":
+            max_files = int(DataProvider._cfg("DEBUG_MAX_FILES", 10))
+            if debug:
+                price_files = price_files[:max_files]
+
+        part_dir = os.path.join(
+            str(DataProvider._cfg("OUTPUT_DIR", "./output")),
+            "panel_parts",
+            f"{DataProvider.VERSION}_{mode}_{adj_norm}_{DataProvider._config_fingerprint()}",
+        )
+        os.makedirs(part_dir, exist_ok=True)
+
+        flush_n = int(DataProvider._cfg("PANEL_FLUSH_N", 200))
+        buffer: List[pd.DataFrame] = []
+        part_paths: List[str] = []
+
+        def _flush() -> None:
+            if not buffer:
+                return
+            part_path = os.path.join(part_dir, f"part_{len(part_paths):05d}.parquet")
+            tmp = pd.concat(buffer, ignore_index=True)
+            DataProvider._atomic_save_parquet(tmp, part_path, index=False)
+            part_paths.append(part_path)
+            buffer.clear()
+
+        fail_fast = bool(DataProvider._cfg("FAIL_FAST", True))
+
+        # rejection counters (observability)
+        rej = {"empty": 0, "qc_fail": 0, "short": 0, "ok": 0, "exc": 0}
+
+        def _iter_outputs() -> Iterable[Optional[pd.DataFrame]]:
+            if backend == "serial":
+                for pf in tqdm(price_files, desc="Alpha+Label(serial)"):
+                    try:
+                        out = DataProvider._process_one_code_file(pf, mode, adj_norm, meta_map, sec_map)
+                        yield out
+                    except Exception as e:
+                        rej["exc"] += 1
+                        logger.exception(f"[serial] Failed on file={pf}: {e}")
+                        if fail_fast:
+                            raise
+                        yield None
+            elif backend == "process":
+                alpha_workers = int(DataProvider._cfg("ALPHA_WORKERS", max(1, (os.cpu_count() or 8) - 1)))
+                chunksize = int(DataProvider._cfg("ALPHA_MAP_CHUNKSIZE", 8))
+                logger.info(f"⚙️  Alpha per-code with {alpha_workers} processes ...")
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=alpha_workers, initializer=_worker_init, initargs=(meta_map, sec_map)
+                ) as ex:
+                    it = ex.map(
+                        _process_one_code_file_worker,
+                        price_files,
+                        itertools.repeat(mode),
+                        itertools.repeat(adj_norm),
+                        chunksize=chunksize,
+                    )
+                    for out in tqdm(it, total=len(price_files), desc="Alpha+Label(process)"):
+                        yield out
+            else:
+                raise ValueError(f"Unknown backend={backend}. Use 'serial' or 'process'.")
+
+        for out in _iter_outputs():
+            if out is None or out.empty:
+                rej["empty"] += 1
+                continue
+            buffer.append(out)
+            rej["ok"] += 1
+            if len(buffer) >= flush_n:
+                _flush()
+        _flush()
+
+        logger.info(f"[Panel] per-code results: ok={rej['ok']} empty={rej['empty']} exc={rej['exc']}")
+
+        if not part_paths:
+            logger.error("❌ No valid data generated. Hints:")
+            logger.error("   1) Check price meta files (or set ALLOW_LEGACY_PRICE_CACHE=True).")
+            logger.error("   2) Try ALIGN_TO_CALENDAR=False if calendar alignment is too strict.")
+            logger.error("   3) Run DEBUG=True to see rejection details.")
+            raise ValueError("Not enough valid price/factor data to build panel.")
+
+        merge_batch = int(DataProvider._cfg("PANEL_MERGE_BATCH", 24))
+        merged_chunks: List[pd.DataFrame] = []
+        for i in range(0, len(part_paths), merge_batch):
+            batch = [pd.read_parquet(p) for p in part_paths[i : i + merge_batch]]
+            merged_chunks.append(pd.concat(batch, ignore_index=True))
+        panel_df = pd.concat(merged_chunks, ignore_index=True) if len(merged_chunks) > 1 else merged_chunks[0]
+
+        panel_df["date"] = pd.to_datetime(panel_df["date"], errors="coerce")
+        panel_df = panel_df.dropna(subset=["date"]).reset_index(drop=True)
+
+        panel_df = DataProvider._tag_universe(panel_df)
+
+        if bool(DataProvider._cfg("USE_CROSS_SECTIONAL", True)):
+            try:
+                panel_df = AlphaFactory.add_cross_sectional_factors(panel_df)
+            except Exception as e:
+                logger.warning(f"Cross-sectional factors skipped (error: {e})")
+
+        prefixes = list(DataProvider._cfg("FEATURE_PREFIXES", ["alpha_", "fac_", "cs_"]))
+        feat_cols = [c for c in panel_df.columns if any(str(c).startswith(p) for p in prefixes)]
+        if feat_cols:
+            panel_df[feat_cols] = (
+                panel_df[feat_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(np.float32, copy=False)
+            )
+
+        panel_df.attrs["adjust"] = adj_norm
+        panel_df.attrs["mode"] = mode
+        panel_df.attrs["fingerprint"] = DataProvider._config_fingerprint()
+        panel_df.attrs["universe_asof"] = str(universe_asof.date())
+        panel_df.attrs["created_by"] = DataProvider.VERSION
+
+        with open(cache_path, "wb") as f:
+            pickle.dump((panel_df, feat_cols), f)
+
+        logger.info(f"✅ Panel Ready. Shape={panel_df.shape} Features={len(feat_cols)} Cache={cache_path}")
+        return panel_df, feat_cols
+
+    @staticmethod
+    def _get_date_splits(panel_df: pd.DataFrame, seq_len: Optional[int] = None) -> Dict[str, pd.Timestamp]:
+        """Single source of truth for Train/Val/Test date splits. (end is EXCLUSIVE)"""
+        if "date" not in panel_df.columns:
+            raise ValueError("panel_df must contain 'date' column")
+
+        dates = pd.to_datetime(panel_df["date"], errors="coerce").dropna().unique()
+        unique_dates = np.sort(dates)
+        n_dates = len(unique_dates)
+        if n_dates == 0:
+            raise ValueError("Empty dates in panel_df")
+
+        train_ratio = float(getattr(Config, "TRAIN_RATIO", 0.7))
+        val_ratio = float(getattr(Config, "VAL_RATIO", 0.15))
+        gap = int(seq_len or getattr(Config, "CONTEXT_LEN", 60))
+
+        train_end_idx = int(n_dates * train_ratio)
+        val_end_idx = int(n_dates * (train_ratio + val_ratio))
+
+        # Keep EXACT semantics consistent with make_dataset():  < train_limit, [val_start, val_limit), [test_start, +inf)
+        train_limit = pd.to_datetime(unique_dates[min(train_end_idx, n_dates - 1)])
+        val_start = pd.to_datetime(unique_dates[min(train_end_idx + gap, n_dates - 1)])
+        val_limit = pd.to_datetime(unique_dates[min(val_end_idx, n_dates - 1)])
+        test_start = pd.to_datetime(unique_dates[min(val_end_idx + gap, n_dates - 1)])
+        last_date = pd.to_datetime(unique_dates[-1])
+
+        # end_excl for printing/filter convenience (calendar +1 day is ok for trading-date series)
+        test_end_excl = last_date + pd.Timedelta(days=1)
+
+        return {
+            "train_start": pd.to_datetime(unique_dates[0]),
+            "train_end_excl": train_limit,
+            "val_start": val_start,
+            "val_end_excl": val_limit,
+            "test_start": test_start,
+            "test_end_excl": test_end_excl,
+            "last_date": last_date,
+        }
+    # =============================================================================
+    # Dataset construction (external interface unchanged)
+    # =============================================================================
+    @staticmethod
+    def make_dataset(panel_df: pd.DataFrame, feature_cols: List[str]):
+        logger.info(">>> [Dataset] Constructing dataset ...")
+
+        panel_df = panel_df.sort_values(["code", "date"]).reset_index(drop=True)
+        panel_df["date"] = pd.to_datetime(panel_df["date"], errors="coerce")
+        panel_df = panel_df.dropna(subset=["date"]).reset_index(drop=True)
+
+        seq_len = int(DataProvider._cfg("CONTEXT_LEN", 60))
+        stride = int(DataProvider._cfg("STRIDE", 1))
+        if seq_len <= 1:
+            raise ValueError("CONTEXT_LEN must be > 1")
+
+        label_col = "rank_label" if "rank_label" in panel_df.columns else "target"
+
+        dates_ns = panel_df["date"].values.astype("datetime64[ns]").astype(np.int64)
+        unique_dates = np.sort(np.unique(dates_ns))
+        n_dates = int(len(unique_dates))
+        if n_dates <= 10:
+            raise ValueError("Not enough dates for split.")
+
+        train_ratio = float(DataProvider._cfg("TRAIN_RATIO", 0.7))
+        val_ratio = float(DataProvider._cfg("VAL_RATIO", 0.15))
+        test_ratio = getattr(Config, "TEST_RATIO", None)
+
+        if test_ratio is not None:
+            test_ratio = float(test_ratio)
+            # if user provides explicit test_ratio, normalize train/val to keep sum=1
+            s = train_ratio + val_ratio + test_ratio
+            if s > 0:
+                train_ratio, val_ratio, test_ratio = train_ratio / s, val_ratio / s, test_ratio / s
+
+        cut1 = max(1, min(n_dates - 2, int(n_dates * train_ratio)))
+        cut2 = max(cut1 + 1, min(n_dates - 1, int(n_dates * (train_ratio + val_ratio))))
+
+        train_end_date = unique_dates[cut1 - 1]
+        val_end_date = unique_dates[cut2 - 1]
+
+        backend = str(DataProvider._cfg("DATASET_BACKEND", "hf_memmap")).lower().strip()
+        fp = str(panel_df.attrs.get("fingerprint") or DataProvider._config_fingerprint())
+        adj_norm = str(panel_df.attrs.get("adjust") or "unknown")
+        mode = str(panel_df.attrs.get("mode") or "train")
+
+        if backend in ("hf_memmap", "memmap"):
+            key = _MemmapStore.key(mode=mode, adj_norm=adj_norm, fp=fp, label_col=label_col, feature_cols=feature_cols)
+
+            if not _MemmapStore.exists(key) or bool(DataProvider._cfg("FORCE_DATASET_REBUILD", False)):
+                logger.info(f"🧠 Building memmap dataset store: key={key}")
+                _MemmapStore.build(panel_df, feature_cols, label_col, key)
+
+            meta, mms = _MemmapStore.open(key)
+            feats = mms["features"]
+            labels = mms["labels"]
+            code_ids = mms["code_ids"]
+            dates = mms["dates"]
+            n = int(meta["n"])
+
+            changes = np.flatnonzero(code_ids[:-1] != code_ids[1:]) + 1
+            start_idx = np.concatenate(([0], changes)).astype(np.int64)
+            end_idx = np.concatenate((changes, [n])).astype(np.int64)
+
+            valid_starts: List[int] = []
+            for st, ed in zip(start_idx.tolist(), end_idx.tolist()):
+                ln = ed - st
+                if ln < seq_len:
+                    continue
+                last = ed - seq_len
+                valid_starts.extend(range(st, last + 1, stride))
+            if not valid_starts:
+                raise ValueError("No valid sequences. Check CONTEXT_LEN / STRIDE / panel size.")
+            valid_starts = np.array(valid_starts, dtype=np.int64)
+
+            pred_dates = dates[valid_starts + (seq_len - 1)]
+            idx_train = valid_starts[pred_dates <= train_end_date]
+            idx_valid = valid_starts[(pred_dates > train_end_date) & (pred_dates <= val_end_date)]
+            idx_test = valid_starts[pred_dates > val_end_date]
+
+            def lazy_transform(batch: Dict[str, List[int]]) -> Dict[str, Any]:
+                s_list = batch["start_idx"]
+                past_values = []
+                y = []
+                for s in s_list:
+                    s = int(s)
+                    e = s + seq_len
+                    past_values.append(np.asarray(feats[s:e, :]))
+                    y.append(float(labels[e - 1]))
+                return {"past_values": past_values, "labels": y}
+
+            ds = DatasetDict(
+                {
+                    "train": Dataset.from_dict({"start_idx": idx_train.tolist()}),
+                    "validation": Dataset.from_dict({"start_idx": idx_valid.tolist()}),
+                    "test": Dataset.from_dict({"start_idx": idx_test.tolist()}),
+                }
+            )
+            ds.set_transform(lazy_transform)
+            return ds, int(meta["fdim"])
+
+        # RAM fallback
+        logger.warning("DATASET_BACKEND != memmap; falling back to in-RAM feature_matrix (may OOM).")
+        feature_matrix = np.ascontiguousarray(panel_df[feature_cols].values.astype(np.float32))
+        target_array = pd.to_numeric(panel_df[label_col], errors="coerce").fillna(0.0).values.astype(np.float32)
+        codes = panel_df["code"].astype(str).values
+
         code_changes = np.where(codes[:-1] != codes[1:])[0] + 1
         start_indices = np.concatenate(([0], code_changes))
         end_indices = np.concatenate((code_changes, [len(codes)]))
 
-        valid_start_indices = []
-        seq_len = Config.CONTEXT_LEN
-        stride = Config.STRIDE
-
-        # 计算所有合法的 Window Start Index
-        for start, end in zip(start_indices, end_indices):
-            length = end - start
-            if length <= seq_len: continue
-
-            # 候选起点
-            curr_starts = np.arange(start, end - seq_len + 1, stride)
-            # 对应的预测点 (切片末尾)
-            pred_indices = curr_starts + seq_len - 1
-
-            # Universe 过滤
-            mask = universe_mask[pred_indices]
-            valid_start_indices.extend(curr_starts[mask])
-
+        valid_start_indices: List[int] = []
+        for st, ed in zip(start_indices, end_indices):
+            ln = ed - st
+            if ln < seq_len:
+                continue
+            last_start = ed - seq_len
+            valid_start_indices.extend(range(st, last_start + 1, stride))
         valid_start_indices = np.array(valid_start_indices, dtype=np.int64)
 
-        # 3. 严格时间切分 (Strict Time Split)
-        unique_dates = np.sort(np.unique(dates))
-        n_dates = len(unique_dates)
+        pred_dates = dates_ns[valid_start_indices + (seq_len - 1)]
+        idx_train = valid_start_indices[pred_dates <= train_end_date]
+        idx_valid = valid_start_indices[(pred_dates > train_end_date) & (pred_dates <= val_end_date)]
+        idx_test = valid_start_indices[pred_dates > val_end_date]
 
-        train_end_idx = int(n_dates * Config.TRAIN_RATIO)
-        val_end_idx = int(n_dates * (Config.TRAIN_RATIO + Config.VAL_RATIO))
-
-        train_date_limit = unique_dates[train_end_idx]
-        val_start_date = unique_dates[min(train_end_idx + Config.CONTEXT_LEN, n_dates - 1)]
-        val_date_limit = unique_dates[val_end_idx]
-        test_start_date = unique_dates[min(val_end_idx + Config.CONTEXT_LEN, n_dates - 1)]
-
-        print(f"\n📊 Dataset Split (Gap={Config.CONTEXT_LEN} days):")
-        print(f"   Train : ~ {train_date_limit}")
-        print(f"   Valid : {val_start_date} ~ {val_date_limit}")
-        print(f"   Test  : {test_start_date} ~")
-
-        # 映射回日期进行筛选
-        sample_pred_dates = dates[valid_start_indices + seq_len - 1]
-
-        idx_train = valid_start_indices[sample_pred_dates < train_date_limit]
-
-        valid_mask = (sample_pred_dates >= val_start_date) & (sample_pred_dates < val_date_limit)
-        idx_valid = valid_start_indices[valid_mask]
-
-        idx_test = valid_start_indices[sample_pred_dates >= test_start_date]
-
-        print(f"   Samples: Train={len(idx_train)}, Valid={len(idx_valid)}, Test={len(idx_test)}")
-
-        # 4. 闭包 Transform 函数 (Lazy Loader)
-        # 此函数在 DataLoader Worker 中被调用
-        def lazy_transform(batch):
-            """
-            batch: {'start_idx': [id1, id2, ...]}
-            """
-            start_idxs = batch['start_idx']
-
+        def lazy_transform(batch: Dict[str, List[int]]) -> Dict[str, Any]:
+            start_idx = batch["start_idx"]
             past_values = []
             labels = []
+            for s in start_idx:
+                s = int(s)
+                e = s + seq_len
+                past_values.append(feature_matrix[s:e])
+                labels.append(float(target_array[e - 1]))
+            return {"past_values": past_values, "labels": labels}
 
-            for start in start_idxs:
-                end = start + seq_len
-                # 这里只产生 View 或极小的 Copy，利用 Shared Memory
-                past_values.append(feature_matrix[start:end])
-                labels.append(target_array[end - 1])
-
-            return {
-                "past_values": past_values,
-                "labels": labels
+        ds = DatasetDict(
+            {
+                "train": Dataset.from_dict({"start_idx": idx_train.tolist()}),
+                "validation": Dataset.from_dict({"start_idx": idx_valid.tolist()}),
+                "test": Dataset.from_dict({"start_idx": idx_test.tolist()}),
             }
-
-        # 5. 构建 Light-weight Dataset
-        ds = DatasetDict({
-            'train': Dataset.from_dict({'start_idx': idx_train}),
-            'validation': Dataset.from_dict({'start_idx': idx_valid}),
-            'test': Dataset.from_dict({'start_idx': idx_test})
-        })
-
-        # 注册 On-the-fly Transform
+        )
         ds.set_transform(lazy_transform)
-
         return ds, len(feature_cols)
 
 
-def get_dataset(force_refresh=False):
-    """External API"""
-    panel_df, feature_cols = DataProvider.load_and_process_panel(mode='train', force_refresh=force_refresh)
+def get_dataset(force_refresh: bool = False, adjust: str = "qfq"):
+    panel_df, feature_cols = DataProvider.load_and_process_panel(mode="train", force_refresh=force_refresh, adjust=adjust)
     return DataProvider.make_dataset(panel_df, feature_cols)

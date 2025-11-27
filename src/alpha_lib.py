@@ -1,378 +1,389 @@
-import pandas as pd
+import logging
+import warnings
+from typing import List, Tuple
+
 import numpy as np
+import pandas as pd
+from scipy.stats import norm
+
 from . import factor_ops as ops
 from .config import Config
-from pandarallel import pandarallel
-import os
-import warnings
 
-# 忽略除零警告等
-warnings.filterwarnings('ignore')
+# Jeff Dean style: narrow ignores; no blanket ignore.
+warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-# 初始化并行计算环境 (Verbose=0 静默模式)
-pandarallel.initialize(progress_bar=False, nb_workers=os.cpu_count(), verbose=0)
+logger = logging.getLogger(__name__)
 
 
 class AlphaFactory:
     """
-    【SOTA Alpha Engine v10.0 - Full Spectrum】
+    【SOTA Alpha Engine v17.0 - "Phantom" Pro, Execution-Aware】
 
-    涵盖七大类因子：
-    0. Raw (原始): 标准化的 OHLCV + Turnover (新增)
-    1. Style (风格): 动量, 波动率, 流动性 (类 Barra)
-    2. Technical (技术): MACD, RSI, KDJ, BOLL
-    3. Fundamental (基本面): 估值, 成长 (需外部财务数据)
-    4. SOTA Alphas (前沿): WorldQuant 风格量价组合
-    5. Advanced (高阶): 偏度, 峰度, Amihud, VoV
-    6. Industrial (微观): YZ波动率, Roll价差, 聪明钱
+    Key updates:
+      1) Prefer upstream fields: dollar_vol / adv20 / (trade masks) if present.
+      2) No aggressive local ffill by default (avoid smoothing across suspensions / missing).
+      3) Cross-sectional pipeline computes stats only on tradable rows (mask-aware).
+      4) Add VERSION for DataProvider cache fingerprinting.
     """
+
+    VERSION = "v17.0"
+    EPS = 1e-9
 
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
 
-        # 1. 基础字段提取 (带类型强制转换)
-        self.open = df['open'].astype(np.float32)
-        self.high = df['high'].astype(np.float32)
-        self.low = df['low'].astype(np.float32)
-        self.close = df['close'].astype(np.float32)
-        self.volume = df['volume'].astype(np.float32)
-        self.turnover = df['turnover'].astype(np.float32)
+        # ---- Ensure date column exists ----
+        if "date" not in self.df.columns:
+            if isinstance(self.df.index, pd.DatetimeIndex):
+                self.df = self.df.reset_index().rename(columns={"index": "date"})
+            else:
+                self.df["date"] = pd.NaT
+        self.df["date"] = pd.to_datetime(self.df["date"], errors="coerce")
 
-        # 确保索引包含日期
-        if 'date' not in self.df.columns and isinstance(self.df.index, pd.DatetimeIndex):
-            self.df = self.df.reset_index()
+        # ---- Cast core numeric columns (best-effort) ----
+        self._cast_float32(
+            [
+                "open", "high", "low", "close", "volume", "turnover", "amount",
+                "dollar_vol", "adv20",
+                "pe_ttm", "pb", "roe", "profit_growth", "rev_growth", "debt_ratio",
+                "tradable_mask", "buyable_mask", "sellable_mask",
+                "limit_rate",
+            ]
+        )
 
-        # 2. 预计算基础中间变量
-        # 基础收益率
-        self.returns = self.close.pct_change()
+        # ---- Required OHLCV ----
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col not in self.df.columns:
+                raise KeyError(f"AlphaFactory requires column '{col}'")
 
-        # [工具函数] 安全对数 (防止 log(0) -> -inf)
-        def safe_log(series):
-            return np.log(np.abs(series) + 1e-9)
+        self.open = self.df["open"]
+        self.high = self.df["high"]
+        self.low = self.df["low"]
+        self.close = self.df["close"]
+        self.volume = self.df["volume"]
 
-        self.safe_log = safe_log
+        self.turnover = (
+            self.df["turnover"] if "turnover" in self.df.columns
+            else pd.Series(np.nan, index=self.df.index, dtype=np.float32)
+        )
+        self.amount = (
+            self.df["amount"] if "amount" in self.df.columns
+            else pd.Series(np.nan, index=self.df.index, dtype=np.float32)
+        )
 
-        # VWAP (成交量加权平均价)
-        # 用累积量计算更准确，但在滑动窗口中常用 (High+Low+Close)/3 * Vol 近似
-        self.vwap = (self.volume * (self.high + self.low + self.close) / 3).cumsum() / (self.volume.cumsum() + 1e-9)
+        # ---- Prefer upstream dollar_vol/adv20 (DataProvider v23 provides them) ----
+        if "dollar_vol" in self.df.columns:
+            self.dollar_vol = self.df["dollar_vol"].astype(np.float32)
+        else:
+            self.dollar_vol = self.amount.where(self.amount.notna(), self.close * self.volume).astype(np.float32)
 
-        # 对数收益率 (具有时间可加性)
-        self.log_ret = safe_log(self.close / (self.close.shift(1) + 1e-9))
+        if "adv20" in self.df.columns:
+            self.adv20 = self.df["adv20"].astype(np.float32)
+        else:
+            self.adv20 = self.dollar_vol.rolling(20, min_periods=1).mean().astype(np.float32)
 
+        # ---- Trade masks (upstream from DataProvider) ----
+        self.tradable_mask = (
+            self.df["tradable_mask"].astype(np.float32)
+            if "tradable_mask" in self.df.columns
+            else pd.Series(1.0, index=self.df.index, dtype=np.float32)
+        )
+        self.buyable_mask = (
+            self.df["buyable_mask"].astype(np.float32)
+            if "buyable_mask" in self.df.columns
+            else self.tradable_mask.copy()
+        )
+        self.sellable_mask = (
+            self.df["sellable_mask"].astype(np.float32)
+            if "sellable_mask" in self.df.columns
+            else self.tradable_mask.copy()
+        )
+
+        # Meta flags for model / CS masking
+        self.df["meta_tradable"] = self.tradable_mask
+        self.df["meta_buyable"] = self.buyable_mask
+        self.df["meta_sellable"] = self.sellable_mask
+        self.df["meta_log_dv"] = self._safe_log(self.dollar_vol)
+
+        # ---- Precomputed basics (NO look-ahead) ----
+        prev_close = self.close.shift(1) + self.EPS
+        self.returns = self.close / prev_close - 1.0
+        self.log_ret = np.log((self.close + self.EPS) / (prev_close + self.EPS))
+
+        # Typical price
+        self.vwap = (self.high + self.low + self.close) / 3.0
+
+    # =============================================================================
+    # Public API
+    # =============================================================================
     def make_factors(self) -> pd.DataFrame:
-        """因子构建流水线"""
-        self._build_raw_factors()  # [新增] 原始行情特征
-        self._build_style_factors()  # 风格
-        self._build_technical_factors()  # 技术
-        self._build_fundamental_factors()  # 基本面
-        self._build_sota_alphas()  # WQ Alphas
-        self._build_advanced_factors()  # 高阶统计
-        self._build_industrial_factors()  # 微观结构
-        self._build_calendar_factors()  # 时间嵌入
-
-        self._preprocess_factors()  # 清洗与标准化
+        self._build_raw_factors()
+        self._build_style_factors()
+        self._build_microstructure()
+        self._build_ccf_a_factors()
+        self._build_fundamental_factors()
+        self._build_advanced_stats()
+        self._build_interactions()
+        self._build_calendar_factors()
+        self._clean_factors_locally()
         return self.df
 
-    # ==========================================================================
-    # 0. Raw Factors (新增：原始数据标准化)
-    # ==========================================================================
+    # =============================================================================
+    # 0) Raw Factors
+    # =============================================================================
     def _build_raw_factors(self):
-        """
-        [Raw Inputs] 将原始 OHLCV 归一化，使模型能感知 K 线形态。
-        注意：直接输入价格是没有意义的（不平稳），必须输入"相对于昨日收盘价"的比率。
-        """
-        # 1. 收益率作为特征
-        self.df['raw_ret'] = self.log_ret
+        prev_close = self.close.shift(1) + self.EPS
 
-        # 2. K线形态特征 (相对于昨日收盘价的涨跌幅)
-        # 这种方式保留了 Open/High/Low 的相对位置信息
-        prev_close = self.close.shift(1) + 1e-9
-        self.df['raw_open_n'] = self.open / prev_close - 1.0
-        self.df['raw_high_n'] = self.high / prev_close - 1.0
-        self.df['raw_low_n'] = self.low / prev_close - 1.0
-        self.df['raw_close_n'] = self.close / prev_close - 1.0
+        self.df["raw_ret"] = self.log_ret
+        self.df["raw_open_n"] = self.open / prev_close - 1.0
+        self.df["raw_high_n"] = self.high / prev_close - 1.0
+        self.df["raw_low_n"] = self.low / prev_close - 1.0
+        self.df["raw_close_n"] = self.close / prev_close - 1.0
 
-        # 3. 成交量特征 (对数化)
-        # 成交量本身绝对值差异极大，必须 Log
-        self.df['raw_volume_n'] = self.safe_log(self.volume)
+        vol_ma = self.volume.rolling(20, min_periods=1).mean() + self.EPS
+        self.df["raw_volume_n"] = np.log((self.volume + self.EPS) / vol_ma)
 
-        # 4. 换手率 (如果可用)
-        # 换手率本身就是归一化的 (Vol / Shares)，直接使用
-        self.df['raw_turnover'] = self.turnover
+        self.df["raw_turnover"] = self.turnover
 
-    # ==========================================================================
-    # 1. Style Factors (风格因子)
-    # ==========================================================================
+        # amount & dollar volume features
+        if "amount" in self.df.columns:
+            amt_ma = self.amount.rolling(20, min_periods=1).mean() + self.EPS
+            self.df["raw_amount_n"] = np.log((self.amount + self.EPS) / amt_ma)
+
+        self.df["raw_dv_log"] = self._safe_log(self.dollar_vol)
+        self.df["raw_adv20_log"] = self._safe_log(self.adv20)
+
+    # =============================================================================
+    # 1) Style Factors
+    # =============================================================================
     def _build_style_factors(self):
-        # 动量 (Momentum)
-        self.df['style_mom_1m'] = ops.ts_sum(self.log_ret, 20)
-        self.df['style_mom_3m'] = ops.ts_sum(self.log_ret, 60)
-        self.df['style_mom_6m'] = ops.ts_sum(self.log_ret, 120)
+        self.df["style_mom_1m"] = ops.ts_sum(self.log_ret, 20)
+        self.df["style_mom_3m"] = ops.ts_sum(self.log_ret, 60)
 
-        # 波动率 (Volatility)
-        self.df['style_vol_1m'] = ops.ts_std(self.returns, 20)
-        self.df['style_vol_3m'] = ops.ts_std(self.returns, 60)
+        self.df["style_vol_1m"] = ops.ts_std(self.returns, 20)
+        self.df["style_risk_adj_mom"] = self.df["style_mom_1m"] / (self.df["style_vol_1m"] + self.EPS)
 
-        # 流动性 (Liquidity)
-        self.df['style_liquidity'] = self.safe_log(ops.ts_sum(self.volume, 20) + 1)
+        # Liquidity scale for downstream neutralization (already set in meta_log_dv)
+        self.df["style_liq_adv20"] = self._safe_log(self.adv20)
 
-        # 市值代理 (Size Proxy)
-        self.df['style_size_proxy'] = self.safe_log(self.close * self.volume + 1)
+    # =============================================================================
+    # 2) Microstructure
+    # =============================================================================
+    def _build_microstructure(self):
+        # Amihud: |ret| / dollar_vol (smoothed)
+        raw_amihud = self.returns.abs() / (self.dollar_vol + self.EPS)
+        self.df["ind_amihud"] = raw_amihud.ewm(span=3, adjust=False).mean() * self.tradable_mask
 
-        # Beta代理 (自相关性)
-        self.df['style_beta_proxy'] = ops.ts_corr(self.returns, self.returns.shift(1), 20)
+        # Smart money: range / log(vol)
+        range_pct = (self.high - self.low) / (self.close + self.EPS)
+        raw_smart = range_pct / (self._safe_log(self.volume) + self.EPS)
+        self.df["ind_smart_money"] = raw_smart.ewm(span=3, adjust=False).mean() * self.tradable_mask
 
-    # ==========================================================================
-    # 2. Technical Factors (技术指标)
-    # ==========================================================================
-    def _build_technical_factors(self):
-        # MACD
-        ema_12 = self.close.ewm(span=12, adjust=False).mean()
-        ema_26 = self.close.ewm(span=26, adjust=False).mean()
-        diff = ema_12 - ema_26
-        dea = diff.ewm(span=9, adjust=False).mean()
-        self.df['tech_macd_hist'] = (diff - dea) * 2
-
-        # RSI
-        delta = self.close.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / (loss + 1e-9)
-        self.df['tech_rsi_14'] = 100 - (100 / (1 + rs))
-
-        # BIAS
-        ma_20 = ops.ts_mean(self.close, 20)
-        self.df['tech_bias_20'] = (self.close - ma_20) / (ma_20 + 1e-9)
-
-        # PSY (心理线)
-        is_up = (self.returns > 0).astype(int)
-        self.df['tech_psy_12'] = ops.ts_sum(is_up, 12) / 12
-
-        # KDJ
-        low_9 = ops.ts_min(self.low, 9)
-        high_9 = ops.ts_max(self.high, 9)
-        rsv = (self.close - low_9) / (high_9 - low_9 + 1e-9) * 100
-        self.df['tech_kdj_k'] = rsv.ewm(com=2).mean()
-        self.df['tech_kdj_d'] = self.df['tech_kdj_k'].ewm(com=2).mean()
-        self.df['tech_kdj_j'] = 3 * self.df['tech_kdj_k'] - 2 * self.df['tech_kdj_d']
-
-        # Bollinger Bands
-        std_20 = ops.ts_std(self.close, 20)
-        upper = ma_20 + 2 * std_20
-        lower = ma_20 - 2 * std_20
-        self.df['tech_bb_width'] = (upper - lower) / (ma_20 + 1e-9)
-        self.df['tech_bb_pctb'] = (self.close - lower) / (upper - lower + 1e-9)
-
-    # ==========================================================================
-    # 3. Fundamental Factors (基本面 - 需外部数据)
-    # ==========================================================================
-    def _build_fundamental_factors(self):
-        # 使用倒数 (EP, BP) 处理负值并保持线性
-        if 'pe_ttm' in self.df.columns:
-            self.df['fund_ep'] = 1.0 / (self.df['pe_ttm'] + 1e-9)
-        if 'pb' in self.df.columns:
-            self.df['fund_bp'] = 1.0 / (self.df['pb'] + 1e-9)
-        if 'roe' in self.df.columns:
-            self.df['fund_roe'] = self.df['roe']
-        if 'profit_growth' in self.df.columns:
-            self.df['fund_growth'] = self.df['profit_growth']
-        if 'debt_ratio' in self.df.columns:
-            self.df['fund_safety'] = -1 * self.df['debt_ratio']
-
-    # ==========================================================================
-    # 4. SOTA Alphas (量价组合)
-    # ==========================================================================
-    def _build_sota_alphas(self):
-        # Alpha 006: -1 * Correlation(Open, Volume, 10)
-        self.df['alpha_006'] = -1 * ops.ts_corr(self.open, self.volume, 10)
-
-        # Alpha 012: Sign(Delta Vol) * (-1 * Delta Close)
-        self.df['alpha_012'] = np.sign(ops.delta(self.volume, 1)) * (-1 * ops.delta(self.close, 1))
-
-        # 趋势强度
-        self.df['alpha_trend_strength'] = ops.ts_mean((self.high - self.low) / (self.close + 1e-9), 14)
-
-        # 量价相关性
-        self.df['alpha_pv_corr'] = ops.ts_corr(ops.ts_rank(self.close, 5), ops.ts_rank(self.volume, 5), 5)
-
-        # 资金流向 (Money Flow / Accumulation Distribution)
-        clv = ((self.close - self.low) - (self.high - self.close)) / (self.high - self.low + 1e-9)
-        self.df['alpha_money_flow'] = ops.decay_linear(clv * self.volume, 20)
-
-    # ==========================================================================
-    # 5. Advanced Factors (高阶统计)
-    # ==========================================================================
-    def _build_advanced_factors(self):
-        # 偏度与峰度
-        self.df['adv_skew_20'] = ops.ts_skew(self.returns, 20)
-        self.df['adv_kurt_20'] = ops.ts_kurt(self.returns, 20)
-
-        # 下行波动率
-        downside_ret = self.returns.copy()
-        downside_ret[downside_ret > 0] = 0
-        self.df['adv_downside_vol'] = ops.ts_std(downside_ret, 20)
-
-        # 考夫曼效率系数 (ER)
-        change = (self.close - self.close.shift(10)).abs()
-        volatility = ops.ts_sum(self.close.diff().abs(), 10)
-        self.df['adv_ker_10'] = change / (volatility + 1e-9)
-
-        # Amihud Illiquidity
-        dollar_volume = self.close * self.volume
-        self.df['adv_amihud'] = self.returns.abs() / (dollar_volume + 1e-9)
-
-        # Spread Proxy (High/Low)
-        hl_ratio = self.safe_log(self.high / (self.low + 1e-9))
-        self.df['adv_spread_proxy'] = ops.ts_mean(hl_ratio, 5)
-
-        # Vol of Vol
-        vol_window = 5
-        rolling_vol = ops.ts_std(self.returns, vol_window)
-        self.df['adv_vol_of_vol'] = ops.ts_std(rolling_vol, 20)
-
-    # ==========================================================================
-    # 6. Industrial Factors (微观结构)
-    # ==========================================================================
-    def _build_industrial_factors(self):
-        # Yang-Zhang Volatility
-        o_c_lag = self.safe_log(self.open / (self.close.shift(1) + 1e-9))
-        c_o = self.safe_log(self.close / (self.open + 1e-9))
-        rs_vol = self.safe_log(self.high / (self.close + 1e-9)) * self.safe_log(self.high / (self.open + 1e-9)) + \
-                 self.safe_log(self.low / (self.close + 1e-9)) * self.safe_log(self.low / (self.open + 1e-9))
-        N = 20
-        k = 0.34
-        sigma_open = ops.ts_std(o_c_lag, N) ** 2
-        sigma_close = ops.ts_std(c_o, N) ** 2
-        sigma_rs = ops.ts_mean(rs_vol, N)
-        self.df['ind_yang_zhang_vol'] = np.sqrt(sigma_open + k * sigma_close + (1 - k) * sigma_rs)
-
-        # Roll Spread
+        # Roll spread proxy
         delta_p = self.close.diff()
         cov_delta = ops.ts_cov(delta_p, delta_p.shift(1), 20)
-        cov_delta[cov_delta > 0] = 0
-        self.df['ind_roll_spread'] = 2 * np.sqrt(-cov_delta + 1e-9)
+        cov_delta = cov_delta.where(cov_delta < 0, 0)
+        self.df["ind_roll_spread"] = 2.0 * np.sqrt(-cov_delta + self.EPS) * self.tradable_mask
 
-        # MAX Factor
-        self.df['ind_max_ret'] = ops.ts_max(self.returns, 20)
+        # Participation proxy: dv / adv20 (helps execution realism)
+        self.df["ind_participation"] = (self.dollar_vol / (self.adv20 + self.EPS)).astype(np.float32) * self.tradable_mask
 
-        # Vol CV
-        self.df['ind_vol_cv'] = ops.ts_std(self.volume, 20) / (ops.ts_mean(self.volume, 20) + 1e-9)
+    # =============================================================================
+    # 3) CCF-A / SOTA-ish Factors
+    # =============================================================================
+    def _build_ccf_a_factors(self):
+        change = (self.close - self.close.shift(20)).abs()
+        path_len = ops.ts_sum(self.close.diff().abs(), 20)
+        self.df["ccf_efficiency_ratio"] = change / (path_len + self.EPS)
 
-        # Smart Money
-        body_len = (self.close - self.open).abs()
-        total_len = (self.high - self.low) + 1e-9
-        self.df['ind_smart_money'] = (body_len / total_len) * self.safe_log(self.volume + 1)
+        vol_short = ops.ts_std(self.returns, 5)
+        vol_long = ops.ts_std(self.returns, 20)
+        self.df["ccf_vol_regime"] = vol_short / (vol_long + self.EPS)
 
-    # ==========================================================================
-    # 7. Calendar Factors (时间嵌入)
-    # ==========================================================================
+        ret_up = self.returns.clip(lower=0)
+        ret_down = (-self.returns.clip(upper=0))
+        self.df["ccf_asymmetry"] = ops.ts_std(ret_up, 20) - ops.ts_std(ret_down, 20)
+
+    # =============================================================================
+    # 4) Fundamentals (keep NaN; CS layer handles fill)
+    # =============================================================================
+    def _build_fundamental_factors(self):
+        if "pe_ttm" in self.df.columns:
+            self.df["fund_ep"] = 1.0 / (self.df["pe_ttm"].replace(0, np.nan) + self.EPS)
+        if "pb" in self.df.columns:
+            self.df["fund_bp"] = 1.0 / (self.df["pb"].replace(0, np.nan) + self.EPS)
+
+        for col in ["roe", "profit_growth", "rev_growth", "debt_ratio"]:
+            if col in self.df.columns:
+                self.df[f"fund_{col}"] = self.df[col]
+
+    # =============================================================================
+    # 5) Advanced stats & interactions
+    # =============================================================================
+    def _build_advanced_stats(self):
+        self.df["adv_skew_20"] = ops.ts_skew(self.returns, 20)
+        self.df["adv_kurt_20"] = ops.ts_kurt(self.returns, 20)
+        self.df["adv_pv_corr"] = ops.ts_corr(self.close, self.volume, 10)
+
+    def _build_interactions(self):
+        self.df["int_ret_div_vol"] = self.returns / (self.df["style_vol_1m"] + self.EPS)
+
+    # =============================================================================
+    # 6) Calendar factors
+    # =============================================================================
     def _build_calendar_factors(self):
-        if 'date' not in self.df.columns: return
-        dates = self.df['date'].dt
-        self.df['time_dow'] = (dates.dayofweek - 2) / 2.0  # -1~1
-        self.df['time_dom'] = (dates.day - 15) / 15.0  # -1~1
-        self.df['time_moy'] = (dates.month - 6.5) / 5.5  # -1~1
+        if "date" not in self.df.columns:
+            return
+        dt = self.df["date"].dt
+        self.df["time_dow"] = dt.dayofweek / 6.0 - 0.5
+        self.df["time_dom"] = (dt.day - 1) / 30.0 - 0.5
+        self.df["time_moy"] = (dt.month - 1) / 11.0 - 0.5
 
-    # ==========================================================================
-    # Post-Processing (正交化与标准化)
-    # ==========================================================================
+    # =============================================================================
+    # Local cleaning (NO aggressive ffill by default)
+    # =============================================================================
+    def _clean_factors_locally(self):
+        factor_prefixes = ["raw_", "style_", "ind_", "ccf_", "adv_", "int_", "time_", "meta_", "fund_"]
+        fac_cols = [c for c in self.df.columns if any(str(c).startswith(p) for p in factor_prefixes)]
 
-    @staticmethod
-    def _orthogonalize_factors(df, factor_cols):
-        """SVD 正交化"""
-        M = df[factor_cols].fillna(0).values
-        try:
-            M_mean = np.mean(M, axis=0)
-            M_std = np.std(M, axis=0) + 1e-9
-            M = (M - M_mean) / M_std
-            U, S, Vh = np.linalg.svd(M, full_matrices=False)
-            M_orth = np.dot(U, Vh)
-            M_orth = (M_orth - np.mean(M_orth, axis=0)) / (np.std(M_orth, axis=0) + 1e-9)
-            return pd.DataFrame(M_orth, columns=factor_cols, index=df.index)
-        except:
-            return df[factor_cols]
+        if not fac_cols:
+            return
 
+        self.df[fac_cols] = self.df[fac_cols].replace([np.inf, -np.inf], np.nan)
+
+        # Optional local fill (off by default)
+        # Recommendation: keep False; let downstream (panel/cs) handle fill to avoid smoothing missingness.
+        if bool(getattr(Config, "ALPHA_LOCAL_FFILL", False)):
+            self.df[fac_cols] = self.df[fac_cols].ffill()
+
+        # enforce mask: untradable -> NaN
+        tradable = self.df["meta_tradable"].notna()
+        self.df.loc[~tradable, fac_cols] = np.nan
+
+    # =============================================================================
+    # Cross-sectional processing (mask-aware; no look-ahead)
+    # =============================================================================
     @staticmethod
     def add_cross_sectional_factors(panel_df: pd.DataFrame) -> pd.DataFrame:
         """
-        [截面处理]
-        1. 截面 Rank (Uniform Dist)
-        2. 市场中性化 (Market Neutral)
-        3. 风格正交化 (Style Orthogonalization)
+        Institutional-ish CS pipeline (mask-aware):
+          1) Fill NaNs with daily median (on tradable rows only)
+          2) Winsorize within each date (1%/99%) on tradable rows only
+          3) Sector/market neutralize (mean subtraction) on tradable rows only
+          4) Residualize on risk factors (liquidity + vol) on tradable rows only
+          5) GaussRank to N(0,1) on tradable rows only
         """
-        if 'date' not in panel_df.columns: panel_df = panel_df.reset_index()
+        if "date" not in panel_df.columns:
+            if isinstance(panel_df.index, pd.DatetimeIndex):
+                panel_df = panel_df.reset_index().rename(columns={"index": "date"})
+            else:
+                panel_df = panel_df.reset_index()
 
-        def apply_cs_clean_and_rank(x):
-            x = ops.winsorize(x, method='mad')
-            rank_val = x.rank(pct=True)
-            return (rank_val - 0.5) * 2  # -> [-1, 1]
+        panel_df["date"] = pd.to_datetime(panel_df["date"], errors="coerce")
 
-        # 1. CS Rank Target (关键因子)
-        target_cols = [
-            'style_mom_1m', 'style_vol_1m', 'style_liquidity',
-            'tech_rsi_14', 'tech_kdj_j', 'tech_bb_width',
-            'alpha_money_flow', 'adv_skew_20', 'alpha_006',
-            'ind_yang_zhang_vol', 'ind_roll_spread', 'ind_max_ret',
-            'fund_ep', 'fund_roe', 'fund_growth'
-        ]
-        valid_cols = [c for c in target_cols if c in panel_df.columns]
+        target_prefixes = ["style_", "ind_", "fund_", "adv_", "int_", "ccf_"]
+        target_cols = [c for c in panel_df.columns if any(str(c).startswith(p) for p in target_prefixes)]
+        if not target_cols:
+            return panel_df
 
-        for col in valid_cols:
-            panel_df[f"cs_rank_{col}"] = panel_df.groupby('date')[col].transform(apply_cs_clean_and_rank)
+        # mask: only tradable rows participate in CS stats
+        if "tradable_mask" in panel_df.columns:
+            mask = panel_df["tradable_mask"].notna()
+        elif "meta_tradable" in panel_df.columns:
+            mask = panel_df["meta_tradable"].notna()
+        else:
+            mask = pd.Series(True, index=panel_df.index)
 
-        # 2. Market Neutralization
-        mkt_features = ['style_mom_1m', 'style_vol_1m', 'style_liquidity', 'alpha_006']
-        mkt_valid = [c for c in mkt_features if c in panel_df.columns]
+        dates = panel_df["date"]
+        X = panel_df[target_cols].copy()
+        X = X.replace([np.inf, -np.inf], np.nan)
 
-        for col in mkt_valid:
-            mkt_mean = panel_df.groupby('date')[col].transform('mean')
-            panel_df[f"rel_{col}"] = panel_df[col] - mkt_mean
-            panel_df[f"mkt_mean_{col}"] = mkt_mean
+        # A) Fill NaNs per date with median (computed on tradable rows only)
+        Xm = X.where(mask)
+        med = Xm.groupby(dates)[target_cols].transform("median")
+        med = med.where(mask)  # prevent filling non-tradable rows
+        Xf = Xm.fillna(med).fillna(0.0).where(mask)  # non-tradable back to NaN
 
-        # 3. SVD Orthogonalization (Optional but SOTA)
-        style_cols = [c for c in panel_df.columns if c.startswith('style_')]
-        if style_cols:
-            # 只有当包含多个风格因子时才做
-            # 注意：这里使用 transform 或者 apply 都可以，group_keys=False 避免索引错乱
-            orth_results = panel_df.groupby('date', group_keys=False)[style_cols].apply(
-                lambda g: AlphaFactory._orthogonalize_factors(g, style_cols)
-            )
-            panel_df.update(orth_results)
+        # B) Winsorize per date (1%/99%) on tradable rows
+        g = Xf.groupby(dates)[target_cols]
+        q = g.quantile([0.01, 0.99])
+        try:
+            lower = q.xs(0.01, level=1)
+            upper = q.xs(0.99, level=1)
+        except Exception:
+            # fallback if quantile shape is unexpected
+            lower = Xf.groupby(dates)[target_cols].transform(lambda s: s.quantile(0.01))
+            upper = Xf.groupby(dates)[target_cols].transform(lambda s: s.quantile(0.99))
+            Xw = Xf.clip(lower, upper, axis=1)
+        else:
+            idx = pd.Index(dates.values)
+            lo = lower.reindex(idx).to_numpy()
+            hi = upper.reindex(idx).to_numpy()
+            lo = np.nan_to_num(lo, nan=-np.inf)
+            hi = np.nan_to_num(hi, nan=np.inf)
+            val = Xf.to_numpy(dtype=np.float64, copy=False)
+            val = np.minimum(np.maximum(val, lo), hi)
+            Xw = pd.DataFrame(val, index=panel_df.index, columns=target_cols).where(mask)
 
-        # 4. Labeling
-        if 'target' in panel_df.columns:
-            panel_df['rank_label'] = panel_df.groupby('date')['target'].transform(lambda x: x.rank(pct=True))
-            market_ret = panel_df.groupby('date')['target'].transform('mean')
-            panel_df['excess_label'] = panel_df['target'] - market_ret
+        # C) Sector/market neutralization (mean subtraction) on tradable rows
+        if "industry" in panel_df.columns:
+            ind_mean = Xw.groupby([dates, panel_df["industry"]])[target_cols].transform("mean")
+            Xn = Xw - ind_mean
+        else:
+            mkt_mean = Xw.groupby(dates)[target_cols].transform("mean")
+            Xn = Xw - mkt_mean
+        Xn = Xn.where(mask)
+
+        # D) Style residualization
+        risk_specs: List[Tuple[str, pd.Series]] = []
+        if "meta_log_dv" in panel_df.columns:
+            risk_specs.append(("meta_log_dv", pd.to_numeric(panel_df["meta_log_dv"], errors="coerce")))
+        if "style_vol_1m" in panel_df.columns:
+            risk_specs.append(("style_vol_1m", pd.to_numeric(panel_df["style_vol_1m"], errors="coerce")))
+
+        Xr = Xn.copy()
+        for risk_name, risk_series in risk_specs:
+            r = risk_series.where(mask)
+            r_mean = r.groupby(dates).transform("mean")
+            r_std = r.groupby(dates).transform("std") + 1e-9
+            rz = (r - r_mean) / r_std
+
+            resid_cols = [c for c in Xr.columns if c != risk_name]
+            if not resid_cols:
+                continue
+
+            prod = Xr[resid_cols].multiply(rz, axis=0)
+            betas = prod.groupby(dates).transform("mean")
+            Xr.loc[:, resid_cols] = Xr[resid_cols] - betas.multiply(rz, axis=0)
+            Xr = Xr.where(mask)
+
+        # E) Gauss rank (tradable-only)
+        ranks = Xr.groupby(dates)[target_cols].rank(pct=True)
+        ranks = ranks * 0.99 + 0.005
+        gauss = norm.ppf(ranks)
+
+        out = pd.DataFrame(gauss, index=panel_df.index, columns=[f"cs_{c}" for c in target_cols]).where(mask)
+        panel_df = pd.concat([panel_df, out], axis=1)
+
+        # Labels (if present): rank among available (non-NaN) target; target already gated upstream.
+        if "target" in panel_df.columns:
+            lbl = panel_df.groupby("date")["target"].rank(pct=True) * 0.99 + 0.005
+            panel_df["rank_label"] = norm.ppf(lbl)
+            mkt = panel_df.groupby("date")["target"].transform("mean")
+            panel_df["excess_label"] = panel_df["target"] - mkt
 
         return panel_df
 
-    def _preprocess_factors(self):
-        """
-        [预处理]
-        对所有 Config 定义的特征前缀进行统一的:
-        FillNa -> Z-Score -> Clip -> FillNa
-        """
-        # 扫描符合 Config 前缀的列
-        factor_cols = [c for c in self.df.columns
-                       if any(c.startswith(p) for p in Config.FEATURE_PREFIXES)]
+    # =============================================================================
+    # Utils
+    # =============================================================================
+    def _cast_float32(self, cols: List[str]):
+        for c in cols:
+            if c in self.df.columns:
+                self.df[c] = pd.to_numeric(self.df[c], errors="coerce").astype(np.float32)
 
-        # 1. 替换 Inf
-        self.df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        # 2. 初次填充
-        self.df[factor_cols] = self.df[factor_cols].fillna(0)
-
-        for col in factor_cols:
-            if col.startswith('time_'): continue  # 时间嵌入不需要标准化
-
-            # 3. Rolling Z-Score (防止未来数据泄露)
-            # 使用过去 60 天的统计量进行标准化
-            series = self.df[col]
-            series = ops.zscore(series, window=60)
-
-            # 4. Clip (盖帽法)
-            series = series.clip(-4, 4)
-            self.df[col] = series
-
-        # 5. 再次填充 (Z-Score 后开头会有 NaN)
-        self.df[factor_cols] = self.df[factor_cols].fillna(0)
+    @staticmethod
+    def _safe_log(x: pd.Series) -> pd.Series:
+        x = pd.to_numeric(x, errors="coerce")
+        return np.log(x.clip(lower=0) + AlphaFactory.EPS).astype(np.float32)

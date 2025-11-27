@@ -1,309 +1,725 @@
-import torch
-import pandas as pd
-import numpy as np
+# -*- coding: utf-8 -*-
+"""
+analysis.py / backtest_analyzer.py (v4 final, reuse SignalEngine, unified masks)
+
+External API unchanged:
+- BacktestAnalyzer(target_set='test'|'eval'|'train'|'custom', start_date=None, end_date=None, adjust='qfq')
+- generate_historical_predictions()
+- analyze_performance()
+
+Core原则：
+1) 历史推理不再手写滑窗：复用 SignalEngine.score_date_range（SSOT）
+2) masks 语义统一：以 DataProvider._add_trade_masks 为准（NaN=不可交易，notna=可交易）
+3) split 使用 end-exclusive，且 end_excl -> end_incl 用“上一交易日”而不是 -1 day
+4) 严格回测：信号T -> 最早可买 d>=T+1 buyable；到期/止损卖出卖不掉可延迟
+
+Assumptions:
+- DataProvider.load_and_process_panel(mode='train', adjust=...) returns panel_df + feature_cols
+- panel_df 尽量包含 OHLCV 与 masks；如果不含 masks，会在 price_df 上补 masks（调用 _add_trade_masks）
+
+"""
+
+from __future__ import annotations
+
+import math
 import os
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+
 from .config import Config
-from .model import PatchTSTForStock
 from .data_provider import DataProvider
 
-# 设置 matplotlib 风格
-plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'DejaVu Sans']
-plt.rcParams['axes.unicode_minus'] = False
+from .core.signal_engine import SignalEngine  # type: ignore
+
+plt.rcParams["font.sans-serif"] = ["Arial Unicode MS", "SimHei", "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
 
 
 class BacktestAnalyzer:
-    def __init__(self, target_set='test', start_date=None, end_date=None):
-        """
-        初始化分析器
-        :param target_set: 目标数据集模式
-               - 'test': (默认) 分析测试集 (基于 Config 比例计算)
-               - 'validation' / 'eval': 分析验证集 (基于 Config 比例计算)
-               - 'train': 分析训练集
-               - 'custom': 自定义范围
-        """
-        self.device = Config.DEVICE
+    def __init__(
+        self,
+        target_set: str = "test",
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        adjust: str = "qfq",
+    ):
         self.model_path = f"{Config.OUTPUT_DIR}/final_model"
-        self.results_df = None
 
-        self.target_set = target_set.lower()
+        self.target_set = str(target_set).lower().strip()
         self.user_start_date = start_date
         self.user_end_date = end_date
+        self.adjust = adjust
 
-        self.analysis_start_date = None
-        self.analysis_end_date = None
+        # end-exclusive
+        self.analysis_start_date: Optional[pd.Timestamp] = None
+        self.analysis_end_date_excl: Optional[pd.Timestamp] = None
 
-    def _resolve_analysis_range(self, panel_df):
-        """
-        【核心修正】严格根据 Config 比例解析分析范围
-        杜绝硬编码 (如 0.9) 导致的 Train/Val/Test 错位
-        """
-        unique_dates = np.sort(panel_df['date'].unique())
+        # outputs
+        self.results_df: Optional[pd.DataFrame] = None
+        self._price_df: Optional[pd.DataFrame] = None
+        self._price_cache: Optional[dict] = None
+        self._bt_daily: Optional[pd.DataFrame] = None
+
+    # =============================================================================
+    # Split logic (end-exclusive, aligned with DataProvider.make_dataset)
+    # =============================================================================
+
+    @staticmethod
+    def _fallback_date_splits(panel_df: pd.DataFrame, seq_len: int) -> Dict[str, pd.Timestamp]:
+        if "date" not in panel_df.columns:
+            raise ValueError("panel_df missing 'date'")
+
+        unique_dates = np.sort(pd.to_datetime(panel_df["date"], errors="coerce").dropna().unique())
         n_dates = len(unique_dates)
+        if n_dates == 0:
+            raise ValueError("panel_df has no valid dates")
 
-        # 1. 从 Config 读取比例 (Single Source of Truth)
-        train_ratio = Config.TRAIN_RATIO
-        val_ratio = Config.VAL_RATIO
-        # test_ratio = 1.0 - train_ratio - val_ratio (隐式)
+        train_ratio = float(getattr(Config, "TRAIN_RATIO", 0.7))
+        val_ratio = float(getattr(Config, "VAL_RATIO", 0.15))
+        gap = int(seq_len)
 
-        # 2. 计算严格的索引边界 (与 data_provider.py make_dataset 逻辑保持原子级一致)
         train_end_idx = int(n_dates * train_ratio)
         val_end_idx = int(n_dates * (train_ratio + val_ratio))
 
-        # GAP = Context Length (防止时序预测中的数据泄漏)
-        gap = Config.CONTEXT_LEN
+        train_limit = pd.to_datetime(unique_dates[min(train_end_idx, n_dates - 1)])
+        val_start = pd.to_datetime(unique_dates[min(train_end_idx + gap, n_dates - 1)])
+        val_limit = pd.to_datetime(unique_dates[min(val_end_idx, n_dates - 1)])
+        test_start = pd.to_datetime(unique_dates[min(val_end_idx + gap, n_dates - 1)])
+        last_date = pd.to_datetime(unique_dates[-1])
 
-        if self.target_set == 'test':
-            # Test Set: 从 (Train + Val) 结束的位置开始，跳过 Gap
-            # 这里的 val_end_idx 就是 Train+Val 的总长度
-            start_idx = min(val_end_idx + gap, n_dates - 1)
+        return {
+            "train_start": pd.to_datetime(unique_dates[0]),
+            "train_end_excl": train_limit,
+            "val_start": val_start,
+            "val_end_excl": val_limit,
+            "test_start": test_start,
+            "test_end_excl": last_date + pd.Timedelta(days=1),
+            "last_date": last_date,
+        }
 
-            self.analysis_start_date = pd.to_datetime(unique_dates[start_idx])
-            self.analysis_end_date = pd.to_datetime(unique_dates[-1])
+    def _get_date_splits(self, panel_df: pd.DataFrame) -> Dict[str, pd.Timestamp]:
+        seq_len = int(getattr(Config, "CONTEXT_LEN", 64))
+        if hasattr(DataProvider, "_get_date_splits"):
+            try:
+                return DataProvider._get_date_splits(panel_df, seq_len=seq_len)  # type: ignore
+            except Exception:
+                return self._fallback_date_splits(panel_df, seq_len=seq_len)
+        return self._fallback_date_splits(panel_df, seq_len=seq_len)
 
-            print(f"\n🔒 [Target: TEST SET] 样本外测试集 (Strict Split):")
-            print(f"   配置比例: Train({train_ratio:.0%}) + Val({val_ratio:.0%}) -> Test")
+    def _resolve_analysis_range(self, panel_df: pd.DataFrame) -> None:
+        splits = self._get_date_splits(panel_df)
 
-        elif self.target_set in ['validation', 'eval', 'val']:
-            # Validation Set: 从 Train 结束的位置开始，跳过 Gap
-            start_idx = min(train_end_idx + gap, n_dates - 1)
-            end_idx = min(val_end_idx, n_dates - 1)
+        if self.target_set == "test":
+            self.analysis_start_date = splits["test_start"]
+            self.analysis_end_date_excl = splits["test_end_excl"]
+            print("\n🔒 [Target: TEST SET] 样本外测试集 (Strict Split, end-exclusive)")
+            print(f"   配置比例: Train({Config.TRAIN_RATIO:.0%}) + Val({Config.VAL_RATIO:.0%}) -> Test")
 
-            self.analysis_start_date = pd.to_datetime(unique_dates[start_idx])
-            self.analysis_end_date = pd.to_datetime(unique_dates[end_idx])
+        elif self.target_set in ["validation", "eval", "val"]:
+            self.analysis_start_date = splits["val_start"]
+            self.analysis_end_date_excl = splits["val_end_excl"]
+            print("\n🔓 [Target: VALIDATION SET] 验证集 (Strict Split, end-exclusive)")
+            print(f"   配置比例: Train({Config.TRAIN_RATIO:.0%}) -> Val({Config.VAL_RATIO:.0%})")
 
-            print(f"\n🔓 [Target: VALIDATION SET] 验证集 (Strict Split):")
-            print(f"   配置比例: Train({train_ratio:.0%}) -> Val")
-
-        elif self.target_set == 'train':
-            # Train Set: 从头开始，到 train_end_idx 结束
-            # 注意：如果要严格防止 Leakage，分析 Train 时不需要 Gap，因为它是起点
-            self.analysis_start_date = pd.to_datetime(unique_dates[0])
-            self.analysis_end_date = pd.to_datetime(unique_dates[train_end_idx])
-            print(f"\n📈 [Target: TRAIN SET] 训练集 (In-Sample):")
+        elif self.target_set == "train":
+            self.analysis_start_date = splits["train_start"]
+            self.analysis_end_date_excl = splits["train_end_excl"]
+            print("\n📈 [Target: TRAIN SET] 训练集 (In-Sample, end-exclusive)")
 
         else:
-            # Custom Range
-            s_date = self.user_start_date or Config.START_DATE
+            s_date = self.user_start_date or getattr(Config, "START_DATE", "20000101")
             e_date = self.user_end_date or "2099-12-31"
-
             self.analysis_start_date = pd.to_datetime(s_date)
-            self.analysis_end_date = pd.to_datetime(e_date)
-            print(f"\n🛠️ [Target: CUSTOM] 自定义时间范围:")
+            self.analysis_end_date_excl = pd.to_datetime(e_date) + pd.Timedelta(days=1)
+            print("\n🛠️ [Target: CUSTOM] 自定义时间范围 (end-exclusive)")
 
-        print(f"   分析区间: {self.analysis_start_date.date()} ~ {self.analysis_end_date.date()}")
+        assert self.analysis_start_date is not None and self.analysis_end_date_excl is not None
+        print(f"   分析区间: {self.analysis_start_date.date()} ~ {(self.analysis_end_date_excl - pd.Timedelta(days=1)).date()}")
 
-    def generate_historical_predictions(self):
-        print("\n" + "=" * 60)
-        print(f">>> [Analysis] 启动截面分析 (Target: {self.target_set})")
-        print("=" * 60)
+    @staticmethod
+    def _prev_trading_date(panel_df: pd.DataFrame, end_excl: pd.Timestamp) -> pd.Timestamp:
+        ud = np.sort(pd.to_datetime(panel_df["date"], errors="coerce").dropna().unique())
+        if len(ud) == 0:
+            return end_excl - pd.Timedelta(days=1)
+        pos = int(np.searchsorted(ud, np.datetime64(end_excl), side="left")) - 1
+        pos = max(pos, 0)
+        return pd.to_datetime(ud[pos]).normalize()
+
+    # =============================================================================
+    # Inference (REUSE SignalEngine) + attach labels + build price cache
+    # =============================================================================
+
+    def generate_historical_predictions(self) -> None:
+        print("\n" + "=" * 72)
+        print(f">>> [Analysis] v4 (reuse SignalEngine) (Target: {self.target_set}, Adjust: {self.adjust})")
+        print("=" * 72)
 
         if not os.path.exists(self.model_path):
             print(f"❌ 模型未找到: {self.model_path}")
             return
 
-        print(f"Loading Model: {self.model_path}")
-        model = PatchTSTForStock.from_pretrained(self.model_path).to(self.device)
-        model.eval()
-
-        print("Loading Full Panel Data...")
-        # 加载全量数据用于定位日期索引
-        panel_df, feature_cols = DataProvider.load_and_process_panel(mode='train')
-
-        # 解析分析区间
-        self._resolve_analysis_range(panel_df)
-
-        # 物理数据切片 (向前回溯 Context Length 以确保第一天能预测)
-        lookback_buffer = Config.CONTEXT_LEN * 2 + 60
-        read_start_date = self.analysis_start_date - pd.Timedelta(days=lookback_buffer)
-
-        mask_date = (panel_df['date'] >= read_start_date) & (panel_df['date'] <= self.analysis_end_date)
-        df_sub = panel_df[mask_date].copy()
-
-        if df_sub.empty:
-            print("❌ 选定区间无有效数据")
+        # 1) Load model/panel via SignalEngine (SSOT)
+        try:
+            model = SignalEngine.load_model(self.model_path)
+        except Exception as e:
+            print(f"❌ Load model failed: {e}")
             return
 
-        print("Start Batch Inference...")
-        all_results = []
-        batch_inputs, batch_meta = [], []
+        try:
+            panel_df, feature_cols = SignalEngine.load_panel(adjust=self.adjust, mode="train")
+        except Exception as e:
+            print(f"❌ Load panel failed: {e}")
+            return
 
-        feat_vals = df_sub[feature_cols].values.astype(np.float32)
-        dates = df_sub['date'].values
-        codes = df_sub['code'].values
+        if panel_df.empty:
+            print("❌ panel_df 为空")
+            return
 
-        if 'rank_label' in df_sub.columns:
-            labels = df_sub['rank_label'].values
+        panel_df = panel_df.copy()
+        panel_df["date"] = pd.to_datetime(panel_df["date"], errors="coerce").dt.normalize()
+        panel_df["code"] = panel_df["code"].astype(str)
+        panel_df = panel_df.dropna(subset=["date", "code"]).sort_values(["code", "date"]).reset_index(drop=True)
+
+        # 2) Resolve analysis window (end-exclusive)
+        self._resolve_analysis_range(panel_df)
+        assert self.analysis_start_date is not None and self.analysis_end_date_excl is not None
+
+        start_incl = pd.to_datetime(self.analysis_start_date).normalize()
+        end_incl = self._prev_trading_date(panel_df, self.analysis_end_date_excl)
+
+        # 3) Prepare price slice for strict backtest (need extra tail for delayed exits)
+        hold_days = int(getattr(Config, "PRED_LEN", 5))
+        max_sell_delay = int(getattr(Config, "BACKTEST_MAX_SELL_DELAY", 5))
+        extra_calendar_days = int(max(90, (hold_days + max_sell_delay + 10) * 4))
+        price_end_excl = self.analysis_end_date_excl + pd.Timedelta(days=extra_calendar_days)
+
+        lookback_buffer = int(getattr(Config, "CONTEXT_LEN", 64) * 2 + 60)
+        read_start_date = start_incl - pd.Timedelta(days=lookback_buffer)
+
+        # Price columns
+        needed_price_cols = ["date", "code", "open", "high", "low", "close", "volume","turnover"]
+        optional_price_cols = ["amount", "dollar_vol", "limit_rate", "tradable_mask", "buyable_mask", "sellable_mask"]
+        keep_price_cols = [c for c in (needed_price_cols + optional_price_cols) if c in panel_df.columns]
+
+        mask_price = (panel_df["date"] >= read_start_date) & (panel_df["date"] < price_end_excl)
+        price_df = panel_df.loc[mask_price, keep_price_cols].copy()
+
+        # ensure dollar_vol for masks
+        if "dollar_vol" not in price_df.columns:
+            if "amount" in price_df.columns:
+                dv = pd.to_numeric(price_df["amount"], errors="coerce")
+                price_df["dollar_vol"] = dv.where(
+                    dv.notna(),
+                    pd.to_numeric(price_df["close"], errors="coerce") * pd.to_numeric(price_df["volume"], errors="coerce"),
+                )
+            else:
+                price_df["dollar_vol"] = pd.to_numeric(price_df["close"], errors="coerce") * pd.to_numeric(price_df["volume"], errors="coerce")
+
+        # if masks missing, add via DataProvider (unified semantics)
+        if not {"tradable_mask", "buyable_mask", "sellable_mask"}.issubset(price_df.columns) and hasattr(DataProvider, "_add_trade_masks"):
+            try:
+                price_df = price_df.sort_values(["code", "date"]).reset_index(drop=True)
+                price_df = DataProvider._add_trade_masks(price_df)  # type: ignore
+            except Exception:
+                price_df["tradable_mask"] = 1.0
+                price_df["buyable_mask"] = 1.0
+                price_df["sellable_mask"] = 1.0
+
+        self._price_df = price_df
+
+        # 4) Score range (REUSE SignalEngine.score_date_range)
+        df_scoring = panel_df[(panel_df["date"] >= read_start_date) & (panel_df["date"] <= end_incl)].copy()
+        if df_scoring.empty:
+            print("❌ scoring window 为空")
+            return
+
+        scores_df = SignalEngine.score_date_range(
+            model=model,
+            panel_df=df_scoring,
+            feature_cols=feature_cols,
+            start_date=start_incl,
+            end_date=end_incl,
+            seq_len=int(getattr(Config, "CONTEXT_LEN", 64)),
+            batch_size=int(getattr(Config, "ANALYSIS_BATCH_SIZE", 2048)),
+            desc="Analysis Scoring",
+        )
+
+        if scores_df is None or scores_df.empty:
+            print("❌ 未生成 score")
+            return
+
+        scores_df = scores_df.copy()
+        scores_df["date"] = pd.to_datetime(scores_df["date"], errors="coerce").dt.normalize()
+        scores_df["code"] = scores_df["code"].astype(str)
+        scores_df["score"] = pd.to_numeric(scores_df["score"], errors="coerce")
+        scores_df = scores_df.dropna(subset=["date", "code", "score"]).reset_index(drop=True)
+
+        # 5) Attach labels (rank_label/excess_label/target) by merge(date,code)
+        label_cols = [c for c in ["rank_label", "excess_label", "target"] if c in panel_df.columns]
+        if not label_cols:
+            merged = scores_df.copy()
+            merged["rank_label"] = np.nan
+            merged["excess_label"] = np.nan
         else:
-            labels = df_sub['target'].values
+            lab = panel_df[["date", "code"] + label_cols].copy()
+            lab["date"] = pd.to_datetime(lab["date"], errors="coerce").dt.normalize()
+            lab["code"] = lab["code"].astype(str)
+            lab = lab.drop_duplicates(subset=["date", "code"], keep="last")
 
-        has_excess = 'excess_label' in df_sub.columns
-        excess_vals = df_sub['excess_label'].values if has_excess else df_sub['target'].values
+            merged = scores_df.merge(lab, on=["date", "code"], how="left")
 
-        unique_codes, code_indices = np.unique(codes, return_index=True)
-        code_indices = np.append(code_indices, len(codes))
+            # rank_label fallback to target
+            if "rank_label" in merged.columns:
+                rl = pd.to_numeric(merged["rank_label"], errors="coerce")
+            else:
+                rl = pd.Series(np.nan, index=merged.index)
+            tgt = pd.to_numeric(merged["target"], errors="coerce") if "target" in merged.columns else pd.Series(np.nan, index=merged.index)
+            merged["rank_label"] = rl.where(rl.notna(), tgt)
 
-        seq_len = Config.CONTEXT_LEN
-        batch_size = Config.ANALYSIS_BATCH_SIZE
+            # excess_label fallback
+            if "excess_label" in merged.columns:
+                el = pd.to_numeric(merged["excess_label"], errors="coerce")
+            else:
+                el = pd.Series(np.nan, index=merged.index)
+            merged["excess_label"] = el.where(el.notna(), tgt)
 
-        for k in tqdm(range(len(unique_codes)), desc="Processing"):
-            start_pos = code_indices[k]
-            end_pos = code_indices[k + 1]
+        self.results_df = merged[["date", "code", "score", "rank_label", "excess_label"]].copy()
+        self.results_df = self.results_df.dropna(subset=["date", "code", "score"]).reset_index(drop=True)
 
-            if end_pos - start_pos < seq_len: continue
+        print(f"✅ 推理完成：{len(self.results_df)} 条预测记录。")
 
-            # 严格筛选日期：只对 Analysis 区间内的 T 时刻进行预测
-            curr_dates = dates[start_pos + seq_len - 1: end_pos]
-            valid_mask = (curr_dates >= np.datetime64(self.analysis_start_date)) & \
-                         (curr_dates <= np.datetime64(self.analysis_end_date))
+        self._price_cache = self._build_price_cache(self._price_df)
 
-            if not np.any(valid_mask): continue
+    # =============================================================================
+    # Strict backtest helpers (unified masks)
+    # =============================================================================
 
-            valid_offsets = np.where(valid_mask)[0]
+    @staticmethod
+    def _build_price_cache(price_df: Optional[pd.DataFrame]) -> dict:
+        if price_df is None or price_df.empty:
+            return {"codes": {}, "calendar": np.array([], dtype="datetime64[ns]")}
 
-            for offset in valid_offsets:
-                pred_idx = start_pos + seq_len - 1 + offset
-                window_start = start_pos + offset
-                window_end = window_start + seq_len
+        df = price_df.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+        df["code"] = df["code"].astype(str)
+        df = df.dropna(subset=["date", "code"]).sort_values(["code", "date"]).reset_index(drop=True)
 
-                batch_inputs.append(feat_vals[window_start:window_end])
-                batch_meta.append({
-                    'date': dates[pred_idx],
-                    'code': codes[pred_idx],
-                    'rank_label': labels[pred_idx],
-                    'excess_label': excess_vals[pred_idx]
-                })
+        cal = np.unique(np.sort(df["date"].values.astype("datetime64[ns]")))
+        codes_cache: Dict[str, Dict[str, Any]] = {}
 
-                if len(batch_inputs) >= batch_size:
-                    self._flush_batch(model, batch_inputs, batch_meta, all_results)
-                    batch_inputs, batch_meta = [], []
+        for code, g in df.groupby("code", sort=False):
+            gg = g.sort_values("date")
+            codes_cache[str(code)] = {
+                "date": gg["date"].values.astype("datetime64[ns]"),
+                "open": pd.to_numeric(gg["open"], errors="coerce").values.astype(np.float64),
+                "high": pd.to_numeric(gg["high"], errors="coerce").values.astype(np.float64) if "high" in gg.columns else None,
+                "low": pd.to_numeric(gg["low"], errors="coerce").values.astype(np.float64) if "low" in gg.columns else None,
+                "close": pd.to_numeric(gg["close"], errors="coerce").values.astype(np.float64),
+                "turnover": pd.to_numeric(gg["turnover"], errors="coerce").values.astype(np.float64),
+                # 关键：mask 用 notna()，避免 bool(np.nan)==True
+                "buyable": gg["buyable_mask"].notna().values if "buyable_mask" in gg.columns else None,
+                "sellable": gg["sellable_mask"].notna().values if "sellable_mask" in gg.columns else None,
+            }
+        return {"codes": codes_cache, "calendar": cal}
 
-        if batch_inputs:
-            self._flush_batch(model, batch_inputs, batch_meta, all_results)
+    @staticmethod
+    def _calc_drawdown(equity: np.ndarray) -> Tuple[float, np.ndarray]:
+        peak = np.maximum.accumulate(equity)
+        dd = equity / (peak + 1e-12) - 1.0
+        return float(dd.min()), dd
 
-        self.results_df = pd.DataFrame(all_results)
-        if not self.results_df.empty:
-            self.results_df['date'] = pd.to_datetime(self.results_df['date'])
-            print(f"✅ 推理完成，生成 {len(self.results_df)} 条预测记录。")
-        else:
-            print("❌ 未生成预测记录 (可能是数据Gap导致区间内无样本)")
+    @staticmethod
+    def _calc_stats(daily_ret: pd.Series, rf_annual: float = 0.0) -> Dict[str, Any]:
+        r = daily_ret.fillna(0.0).values.astype(np.float64)
+        n = len(r)
+        if n == 0:
+            return {}
 
-    def _flush_batch(self, model, inputs, meta, results_list):
-        tensor = torch.tensor(np.array(inputs), dtype=torch.float32).to(self.device)
-        with torch.no_grad():
-            outputs = model(past_values=tensor)
-            scores = outputs.logits.squeeze().cpu().numpy()
+        rf_daily = rf_annual / 252.0
+        equity = np.cumprod(1.0 + r)
+        total_ret = float(equity[-1] - 1.0)
+        ann_ret = float((equity[-1] ** (252.0 / max(n, 1))) - 1.0)
+        vol = float(np.std(r, ddof=1) * np.sqrt(252.0)) if n > 1 else 0.0
+        sharpe = float((np.mean(r) - rf_daily) / (np.std(r, ddof=1) + 1e-12) * np.sqrt(252.0)) if n > 1 else 0.0
+        mdd, dd_series = BacktestAnalyzer._calc_drawdown(equity)
+        win_rate = float((r > 0).mean())
+        return {
+            "total_return": total_ret,
+            "annual_return": ann_ret,
+            "annual_vol": vol,
+            "sharpe": sharpe,
+            "max_drawdown": mdd,
+            "win_rate": win_rate,
+            "equity": equity,
+            "drawdown": dd_series,
+        }
 
-        if scores.ndim == 0: scores = [scores]
+    def _compute_trade_path_unified(
+        self,
+        code_cache: Dict[str, Any],
+        signal_date: pd.Timestamp,
+        hold_days: int,
+        slippage: float,
+        commission: float,
+        stamp: float,
+        stop_loss: float,
+        max_entry_delay: int,
+        max_sell_delay: int,
+    ) -> Optional[List[Tuple[np.datetime64, float]]]:
+        code_dates = code_cache["date"]
+        op = code_cache["open"]
+        cl = code_cache["close"]
+        lo = code_cache.get("low", None)
 
-        limit = min(len(meta), len(scores))
-        for i in range(limit):
-            meta[i]['score'] = float(scores[i])
-            results_list.append(meta[i])
+        buyable = code_cache.get("buyable", None)
+        sellable = code_cache.get("sellable", None)
 
-    def analyze_performance(self):
+        t = np.datetime64(pd.to_datetime(signal_date).normalize(), "ns")
+        i = int(np.searchsorted(code_dates, t))
+        if i >= len(code_dates) or code_dates[i] != t:
+            return None
+
+        # entry: first buyable day >= T+1
+        entry_i0 = i + 1
+        if entry_i0 >= len(code_dates):
+            return None
+
+        entry_i = None
+        end_search = min(len(code_dates), entry_i0 + max_entry_delay + 1)
+        for j in range(entry_i0, end_search):
+            if not (np.isfinite(op[j]) and op[j] > 0):
+                continue
+            if buyable is not None and (not bool(buyable[j])):
+                continue
+            entry_i = j
+            break
+        if entry_i is None:
+            return None
+
+        eff_entry = op[entry_i] * (1.0 + slippage + commission)
+        if not (np.isfinite(eff_entry) and eff_entry > 0):
+            return None
+
+        exit_i = entry_i + max(int(hold_days) - 1, 0)
+        if exit_i >= len(code_dates):
+            return None
+
+        # stop-loss
+        if stop_loss > 0 and lo is not None:
+            sl = abs(float(stop_loss))
+            for j in range(entry_i, exit_i + 1):
+                if not np.isfinite(lo[j]):
+                    continue
+                dd = lo[j] / (eff_entry + 1e-12) - 1.0
+                if dd <= -sl:
+                    req = j
+                    cand = req
+                    if sellable is not None:
+                        while cand < len(code_dates) and (not bool(sellable[cand])) and (cand - req) <= max_sell_delay:
+                            cand += 1
+                        if cand >= len(code_dates) or (not bool(sellable[cand])):
+                            return None
+                    exit_i = cand
+                    break
+
+        # sell delay
+        if sellable is not None and (not bool(sellable[exit_i])):
+            req = exit_i
+            cand = req
+            while cand < len(code_dates) and (not bool(sellable[cand])) and (cand - req) < max_sell_delay:
+                cand += 1
+            if cand >= len(code_dates) or (not bool(sellable[cand])):
+                return None
+            exit_i = cand
+
+        sell_cost = slippage + commission + stamp
+        path: List[Tuple[np.datetime64, float]] = []
+
+        for j in range(entry_i, exit_i + 1):
+            d = code_dates[j]
+            if j == entry_i:
+                if not (np.isfinite(cl[j]) and cl[j] > 0):
+                    return None
+                r = cl[j] / (eff_entry + 1e-12) - 1.0
+            elif j < exit_i:
+                if not (np.isfinite(cl[j]) and np.isfinite(cl[j - 1]) and cl[j - 1] > 0):
+                    return None
+                r = cl[j] / (cl[j - 1] + 1e-12) - 1.0
+            else:
+                if not (np.isfinite(cl[j]) and np.isfinite(cl[j - 1]) and cl[j - 1] > 0):
+                    return None
+                adj_exit = cl[j] * (1.0 - sell_cost)
+                r = adj_exit / (cl[j - 1] + 1e-12) - 1.0
+            path.append((d, float(r)))
+
+        return path
+
+    def _simulate_overlap_topk(self, pred_df: pd.DataFrame) -> pd.DataFrame:
+        assert self._price_cache is not None
+        codes_cache = self._price_cache["codes"]
+        calendar = self._price_cache["calendar"]
+        if len(calendar) == 0:
+            raise ValueError("Empty price calendar for backtest")
+
+        hold_days = int(getattr(Config, "PRED_LEN", 5))
+        top_k = int(getattr(Config, "TOP_K", 5))
+
+        enable_ls = bool(getattr(Config, "BACKTEST_LONG_SHORT", True))
+        short_k = int(getattr(Config, "BACKTEST_SHORT_K", top_k))
+
+        cash_buffer = float(getattr(Config, "CASH_BUFFER", 0.95))
+        rf_annual = float(getattr(Config, "RISK_FREE_RATE", 0.0))
+
+        slippage = float(getattr(Config, "SLIPPAGE", 0.0))
+        commission = float(getattr(Config, "COMMISSION_RATE", 0.0))
+        stamp = float(getattr(Config, "STAMP_DUTY", 0.0))
+        stop_loss = float(getattr(Config, "STOP_LOSS_PCT", 0.0))
+
+        max_entry_delay = int(getattr(Config, "BACKTEST_MAX_ENTRY_DELAY", 3))
+        max_sell_delay = int(getattr(Config, "BACKTEST_MAX_SELL_DELAY", 5))
+
+        cap_slice = cash_buffer / max(hold_days, 1)
+
+        assert self.analysis_start_date is not None and self.analysis_end_date_excl is not None
+        sig_start = np.datetime64(self.analysis_start_date.normalize(), "ns")
+        sig_end = np.datetime64(self.analysis_end_date_excl.normalize(), "ns")
+
+        date_to_idx = {d: i for i, d in enumerate(calendar)}
+        ret_long = np.zeros(len(calendar), dtype=np.float64)
+        exp_long = np.zeros(len(calendar), dtype=np.float64)
+        ret_ls = np.zeros(len(calendar), dtype=np.float64)
+        exp_ls = np.zeros(len(calendar), dtype=np.float64)
+
+        pred_df = pred_df.copy()
+        pred_df["date"] = pd.to_datetime(pred_df["date"], errors="coerce").dt.normalize()
+        pred_df["code"] = pred_df["code"].astype(str)
+        pred_df["score"] = pd.to_numeric(pred_df["score"], errors="coerce")
+        pred_df = pred_df.dropna(subset=["date", "code", "score"]).copy()
+
+        signal_dates = np.sort(pred_df["date"].unique())
+        for d in tqdm(signal_dates, desc="StrictBacktest(signal dates)"):
+            dn = np.datetime64(pd.to_datetime(d), "ns")
+            if not (sig_start <= dn < sig_end):
+                continue
+
+            day = pred_df[pred_df["date"] == d]
+            if day.empty:
+                continue
+
+            day_sorted_desc = day.sort_values("score", ascending=False)
+            long_codes = day_sorted_desc["code"].head(top_k).tolist()
+
+            short_codes: List[str] = []
+            if enable_ls:
+                day_sorted_asc = day.sort_values("score", ascending=True)
+                short_codes = day_sorted_asc["code"].head(short_k).tolist()
+
+            long_paths: List[List[Tuple[np.datetime64, float]]] = []
+            for code in long_codes:
+                cc = codes_cache.get(code)
+                if cc is None:
+                    continue
+                p = self._compute_trade_path_unified(
+                    cc, pd.to_datetime(d), hold_days, slippage, commission, stamp, stop_loss, max_entry_delay, max_sell_delay
+                )
+                if p:
+                    long_paths.append(p)
+
+            short_paths: List[List[Tuple[np.datetime64, float]]] = []
+            for code in short_codes:
+                cc = codes_cache.get(code)
+                if cc is None:
+                    continue
+                p = self._compute_trade_path_unified(
+                    cc, pd.to_datetime(d), hold_days, slippage, commission, stamp, stop_loss, max_entry_delay, max_sell_delay
+                )
+                if p:
+                    short_paths.append(p)
+
+            if long_paths:
+                w = cap_slice / len(long_paths)
+                for path in long_paths:
+                    for dt64, r in path:
+                        idx = date_to_idx.get(dt64)
+                        if idx is None:
+                            continue
+                        ret_long[idx] += w * r
+                        exp_long[idx] += abs(w)
+
+            if enable_ls:
+                if long_paths:
+                    wl = (cap_slice * 0.5) / len(long_paths)
+                    for path in long_paths:
+                        for dt64, r in path:
+                            idx = date_to_idx.get(dt64)
+                            if idx is None:
+                                continue
+                            ret_ls[idx] += wl * r
+                            exp_ls[idx] += abs(wl)
+                if short_paths:
+                    ws = (cap_slice * 0.5) / len(short_paths)
+                    for path in short_paths:
+                        for dt64, r in path:
+                            idx = date_to_idx.get(dt64)
+                            if idx is None:
+                                continue
+                            ret_ls[idx] -= ws * r
+                            exp_ls[idx] += abs(ws)
+
+        rf_daily = rf_annual / 252.0
+        out = pd.DataFrame(
+            {"date": pd.to_datetime(calendar), "ret_long_raw": ret_long, "exp_long": exp_long, "ret_ls_raw": ret_ls, "exp_ls": exp_ls}
+        ).sort_values("date")
+
+        clip_start = self.analysis_start_date - pd.Timedelta(days=5)
+        clip_end = self.analysis_end_date_excl + pd.Timedelta(days=180)
+        out = out[(out["date"] >= clip_start) & (out["date"] < clip_end)].reset_index(drop=True)
+
+        # leverage guard：exp > CASH_BUFFER 则缩放当日收益 & 截断 exp
+        def _cap_exposure(ret_raw: pd.Series, exp: pd.Series, cap: float) -> Tuple[pd.Series, pd.Series]:
+            expv = exp.values.astype(np.float64)
+            rrv = ret_raw.values.astype(np.float64)
+            scale = np.ones_like(expv)
+            over = expv > cap
+            scale[over] = cap / (expv[over] + 1e-12)
+            return pd.Series(rrv * scale, index=ret_raw.index), pd.Series(np.minimum(expv, cap), index=exp.index)
+
+        out["ret_long_raw"], out["exp_long"] = _cap_exposure(out["ret_long_raw"], out["exp_long"], cash_buffer)
+        out["ret_ls_raw"], out["exp_ls"] = _cap_exposure(out["ret_ls_raw"], out["exp_ls"], cash_buffer)
+
+        out["cash_w_long"] = (1.0 - out["exp_long"]).clip(0.0, 1.0)
+        out["cash_w_ls"] = (1.0 - out["exp_ls"]).clip(0.0, 1.0)
+
+        out["ret_long"] = out["ret_long_raw"] + out["cash_w_long"] * rf_daily
+        out["ret_ls"] = out["ret_ls_raw"] + out["cash_w_ls"] * rf_daily
+
+        out["equity_long"] = (1.0 + out["ret_long"].fillna(0.0)).cumprod()
+        out["equity_ls"] = (1.0 + out["ret_ls"].fillna(0.0)).cumprod()
+        return out
+
+    # =============================================================================
+    # Public performance: IC + strict backtest
+    # =============================================================================
+
+    def analyze_performance(self) -> None:
         if self.results_df is None or self.results_df.empty:
-            print("⚠️ 结果集为空")
+            print("⚠️ 结果集为空（先运行 generate_historical_predictions）")
             return
 
         df = self.results_df.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+        df["score"] = pd.to_numeric(df["score"], errors="coerce")
+        df["rank_label"] = pd.to_numeric(df["rank_label"], errors="coerce")
+        df = df.dropna(subset=["date", "score", "rank_label"]).copy()
+        if df.empty:
+            print("⚠️ 清洗后结果集为空（score/rank_label 全 NaN）")
+            return
 
-        df['score_rank'] = df.groupby('date')['score'].rank(pct=True)
-        df['label_rank'] = df.groupby('date')['rank_label'].rank(pct=True)
+        # ---- IC ----
+        min_cs = int(getattr(Config, "ANALYSIS_MIN_CROSS_SECTION", 50))
+        cnt = df.groupby("date")["score"].transform("size")
+        df_ic = df[cnt >= min_cs].copy()
 
-        daily_ic = df.groupby('date').apply(
-            lambda x: x['score_rank'].corr(x['label_rank'])
+        daily_ic = None
+        ic_mean = icir = ic_win_rate = 0.0
+
+        if not df_ic.empty:
+            df_ic["score_rank"] = df_ic.groupby("date")["score"].rank(pct=True)
+            df_ic["label_rank"] = df_ic.groupby("date")["rank_label"].rank(pct=True)
+            daily_ic = df_ic.groupby("date").apply(lambda x: x["score_rank"].corr(x["label_rank"]))
+
+            ic_mean = float(daily_ic.mean())
+            ic_std = float(daily_ic.std())
+            icir = ic_mean / (ic_std + 1e-9) * math.sqrt(252.0)
+            ic_win_rate = float((daily_ic > 0).mean())
+
+            print("-" * 60)
+            print(f"📊 【因子绩效(IC)】 (Set: {self.target_set.upper()}, Adjust: {self.adjust})")
+            print("-" * 60)
+            print(f"Rank IC (Mean) : {ic_mean:.4f}")
+            print(f"ICIR (Annual)  : {icir:.4f}")
+            print(f"IC Win Rate    : {ic_win_rate:.2%}")
+            print(f"Days Evaluated : {len(daily_ic)}")
+            print("-" * 60)
+        else:
+            print(f"⚠️ IC：每日截面样本数不足（<{min_cs}），跳过 IC 统计。")
+
+        # ---- strict backtest ----
+        if self._price_cache is None:
+            self._price_cache = self._build_price_cache(self._price_df)
+
+        bt = self._simulate_overlap_topk(df)
+        self._bt_daily = bt
+
+        rf_annual = float(getattr(Config, "RISK_FREE_RATE", 0.0))
+        stats_long = self._calc_stats(bt["ret_long"], rf_annual=rf_annual)
+        stats_ls = self._calc_stats(bt["ret_ls"], rf_annual=rf_annual)
+
+        print("-" * 60)
+        print("💼 【严格回测(可交易, 重叠持仓, masks 口径统一)】")
+        print("-" * 60)
+        print(
+            f"Long-only:  Total={stats_long['total_return']:.2%}  Ann={stats_long['annual_return']:.2%}  "
+            f"Vol={stats_long['annual_vol']:.2%}  Sharpe={stats_long['sharpe']:.2f}  "
+            f"MDD={stats_long['max_drawdown']:.2%}  Win={stats_long['win_rate']:.2%}"
         )
+        print(
+            f"Long-Short: Total={stats_ls['total_return']:.2%}  Ann={stats_ls['annual_return']:.2%}  "
+            f"Vol={stats_ls['annual_vol']:.2%}  Sharpe={stats_ls['sharpe']:.2f}  "
+            f"MDD={stats_ls['max_drawdown']:.2%}  Win={stats_ls['win_rate']:.2%}"
+        )
+        print("-" * 60)
 
-        ic_mean = daily_ic.mean()
-        ic_std = daily_ic.std()
-        icir = ic_mean / (ic_std + 1e-9) * np.sqrt(252)
-        ic_win_rate = (daily_ic > 0).mean()
+        self._plot_results(daily_ic, ic_mean, icir, ic_win_rate, bt, stats_long, stats_ls)
 
-        print("-" * 50)
-        print(f"📊 【因子深度绩效报告】 (Set: {self.target_set.upper()})")
-        print("-" * 50)
-        print(f"Rank IC (Mean) : {ic_mean:.4f}")
-        print(f"ICIR (Annual)  : {icir:.4f}")
-        print(f"IC Win Rate    : {ic_win_rate:.2%}")
-        print("-" * 50)
-
-        self._plot_results(df, daily_ic, ic_mean, icir, ic_win_rate)
-
-    def _plot_results(self, df, daily_ic, ic_mean, icir, ic_win_rate):
+    def _plot_results(self, daily_ic, ic_mean, icir, ic_win_rate, bt_df, stats_long, stats_ls) -> None:
         plt.figure(figsize=(16, 12))
 
-        # 1. Cumulative IC
         ax1 = plt.subplot(3, 1, 1)
-        daily_ic_cumsum = daily_ic.cumsum()
-        ax1.plot(daily_ic_cumsum.index, daily_ic_cumsum.values, label='Cumulative Rank IC', color='#4B0082',
-                 linewidth=1.5)
-        ax1.set_title(f'Cumulative Rank IC (ICIR={icir:.2f}) - {self.target_set.upper()}', fontsize=12,
-                      fontweight='bold')
-        ax1.grid(True, linestyle='--', alpha=0.4)
-        ax1.legend(loc='upper left')
+        if daily_ic is not None and len(daily_ic) > 0:
+            ic_curve = daily_ic.fillna(0.0).cumsum()
+            ax1.plot(ic_curve.index, ic_curve.values, label="Cumulative Rank IC", linewidth=1.5)
+            ax1.set_title(f"Cumulative Rank IC (ICIR={icir:.2f}) - {self.target_set.upper()}", fontsize=12, fontweight="bold")
+            ax1.legend(loc="upper left")
+        else:
+            ax1.text(0.02, 0.5, "IC not available", transform=ax1.transAxes, fontsize=12)
+            ax1.set_title("Cumulative Rank IC", fontsize=12, fontweight="bold")
+        ax1.grid(True, linestyle="--", alpha=0.4)
 
-        # 2. Daily IC
         ax2 = plt.subplot(3, 1, 2)
-        colors = ['#d32f2f' if v < 0 else '#388e3c' for v in daily_ic.values]
-        ax2.bar(daily_ic.index, daily_ic.values, color=colors, alpha=0.6, width=1.0, label='Daily IC')
-        ax2.axhline(ic_mean, color='blue', linestyle='--', linewidth=1.5, label=f'Mean IC: {ic_mean:.3f}')
-        ax2.axhline(0, color='black', linewidth=0.8)
-        ax2.set_title(f'Daily IC Distribution (Win Rate={ic_win_rate:.1%})', fontsize=12, fontweight='bold')
-        ax2.legend(loc='upper right')
-        ax2.grid(True, axis='y', linestyle='--', alpha=0.4)
+        if daily_ic is not None and len(daily_ic) > 0:
+            vals = daily_ic.fillna(0.0).values
+            colors = ["#d32f2f" if v < 0 else "#388e3c" for v in vals]
+            ax2.bar(daily_ic.index, vals, color=colors, alpha=0.6, width=1.0, label="Daily IC")
+            ax2.axhline(ic_mean, linestyle="--", linewidth=1.5, label=f"Mean IC: {ic_mean:.3f}")
+            ax2.axhline(0, color="black", linewidth=0.8)
+            ax2.set_title(f"Daily IC (Win Rate={ic_win_rate:.1%})", fontsize=12, fontweight="bold")
+            ax2.legend(loc="upper right")
+        else:
+            ax2.text(0.02, 0.5, "IC not available", transform=ax2.transAxes, fontsize=12)
+            ax2.set_title("Daily IC", fontsize=12, fontweight="bold")
+        ax2.grid(True, axis="y", linestyle="--", alpha=0.4)
 
-        # 3. Layered Backtest
         ax3 = plt.subplot(3, 1, 3)
-        df['group'] = df.groupby('date')['score'].transform(
-            lambda x: pd.qcut(x, 5, labels=False, duplicates='drop')
-        )
-        layer_ret = df.groupby(['date', 'group'])['excess_label'].mean().unstack()
-
-        if Config.PRED_LEN > 1:
-            layer_ret = layer_ret / Config.PRED_LEN
-
-        layer_ret = layer_ret.fillna(0)
-        cum_ret = (1 + layer_ret).cumprod()
-
-        groups = sorted(layer_ret.columns)
-        for idx, g in enumerate(groups):
-            if g == groups[-1]:
-                label, c, lw, alpha = "Top 20% (Long)", "#d32f2f", 2.0, 1.0
-            elif g == groups[0]:
-                label, c, lw, alpha = "Bottom 20% (Short)", "#388e3c", 1.5, 0.8
-            else:
-                label, c, lw, alpha = f"Group {g}", "gray", 0.8, 0.3
-
-            ax3.plot(cum_ret.index, cum_ret[g], label=label, color=c, linewidth=lw, alpha=alpha)
-
-        if len(groups) >= 2:
-            ls_ret = layer_ret[groups[-1]] - layer_ret[groups[0]]
-            ls_cum = (1 + ls_ret).cumprod()
-            ax3.plot(ls_cum.index, ls_cum, label='Long-Short Alpha', color='blue', linestyle='--', linewidth=1.5)
-
-        ax3.set_title(f'Layered Backtest ({self.target_set.upper()})', fontsize=12, fontweight='bold')
-        ax3.legend(loc='upper left', ncol=2)
-        ax3.grid(True, linestyle='--', alpha=0.4)
+        ax3.plot(bt_df["date"], bt_df["equity_long"], label=f"Long-only (Sharpe={stats_long['sharpe']:.2f}, MDD={stats_long['max_drawdown']:.2%})", linewidth=1.6)
+        ax3.plot(bt_df["date"], bt_df["equity_ls"], label=f"Long-Short (Sharpe={stats_ls['sharpe']:.2f}, MDD={stats_ls['max_drawdown']:.2%})", linestyle="--", linewidth=1.6)
+        ax3.set_title(f"Strict Backtest (Overlap Holding, H={int(getattr(Config,'PRED_LEN',5))})", fontsize=12, fontweight="bold")
+        ax3.legend(loc="upper left")
+        ax3.grid(True, linestyle="--", alpha=0.4)
 
         plt.tight_layout()
+        os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
         save_path = os.path.join(Config.OUTPUT_DIR, f"report_{self.target_set}.png")
         plt.savefig(save_path, dpi=150)
         print(f"📈 图表已保存至: {save_path}")
 
 
 if __name__ == "__main__":
-    # === 使用示例 ===
-
-    # 1. 分析测试集 (Out-of-Sample) [默认]
-    # print(">>> Mode: Test Set")
-    # analyzer = BacktestAnalyzer(target_set='test')
-    # analyzer.generate_historical_predictions()
-    # analyzer.analyze_performance()
-
-    # 2. 分析验证集 (Eval Set - 检查是否过拟合)
-    print(">>> Mode: Eval Set")
-    analyzer = BacktestAnalyzer(target_set='eval')
+    print(">>> Mode: Eval Set (QFQ)")
+    analyzer = BacktestAnalyzer(target_set="eval", adjust="qfq")
     analyzer.generate_historical_predictions()
     analyzer.analyze_performance()

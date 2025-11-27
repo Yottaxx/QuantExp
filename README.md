@@ -118,3 +118,31 @@ SotaQuant/
 数据说明: 使用的公开数据源可能存在延迟或误差。
 模型风险: 历史回测业绩不代表未来表现，模型存在过拟合风险。
 实盘风险: 代码未包含实盘交易接口，实际交易需考虑滑点、撤单等复杂情况。
+
+
+下载（qfq+raw 全下）：
+python main.py download --adjust all
+
+构建 panel：
+python main.py panel --mode train --adjust qfq --force
+
+训练：
+python main.py train --adjust qfq --force
+
+选股（inference / predict）：
+python main.py inference --adjust qfq --top-k 10 --threshold 0.6
+
+回测（自动生成 backtrader feed parquet）：
+python main.py backtest --adjust qfq --top-k 5 --cash 1000000
+
+Walk-forward：
+python main.py walkforward --start-date 2023-01-01 --end-date 2024-12-31 --top-k 5
+
+分析报告：
+python main.py analysis --target-set test
+
+因子评估：
+python main.py alpha-eval --prefix alpha_,fac_ --target-col target
+
+单只股票断点 debug 因子：
+python main.py debug-alpha --code 600519 --adjust qfq
