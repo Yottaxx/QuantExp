@@ -31,8 +31,8 @@ def _set_seed(seed: int) -> None:
     """
     try:
         seed_mod = importlib.import_module("utils.seed_utils")
-        if hasattr(seed_mod, "set_seed"):
-            seed_mod.set_seed(seed)  # type: ignore
+        if hasattr(seed_mod, "set_global_seed"):
+            seed_mod.set_global_seed(seed)  # type: ignore
             return
     except Exception:
         pass
