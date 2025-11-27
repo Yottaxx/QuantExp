@@ -25,8 +25,8 @@ class Config:
 
     # --- 网络配置 ---
     PROXY_URL = "http://127.0.0.1:7890"
-    CLASH_API_URL = "http://127.0.0.1:9090"
-    CLASH_SECRET = ""
+    CLASH_API_URL = "http://127.0.0.1:49812"
+    CLASH_SECRET = "b342ba26-2ae3-47bb-a057-6624e171d5c6"
 
     BENCHMARK_SYMBOL = "sh000300"
     MARKET_INDEX_SYMBOL = "sh000001"
