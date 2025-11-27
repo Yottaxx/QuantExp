@@ -32,7 +32,7 @@ class Config:
     MARKET_INDEX_SYMBOL = "sh000001"
 
     FEATURE_PREFIXES = [
-        'style_', 'tech_', 'alpha_', 'adv_', 'ind_', 'fund_',
+        'raw_','style_', 'tech_', 'alpha_', 'adv_', 'ind_', 'fund_',
         'cs_rank_', 'mkt_', 'rel_', 'time_'
     ]
 

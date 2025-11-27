@@ -2,79 +2,48 @@ import pandas as pd
 import numpy as np
 from scipy.stats import rankdata
 
-
 # ==============================================================================
-# 第一部分：时间序列算子 (Time-Series Operators)
-# 场景：针对【单只股票】的历史数据进行滑动窗口计算。
-# 作用：提取该股票在时间维度上的趋势、波动和形态特征。
+# 基础辅助函数 (Helper Functions)
 # ==============================================================================
 
-def ts_mean(x: pd.Series, window: int) -> pd.Series:
-    return x.rolling(window=window).mean()
+def _to_int(n):
+    """将窗口参数强制转为整数 (兼容 WQ 公式中的浮点窗口)"""
+    return int(round(n))
 
-def ts_std(x: pd.Series, window: int) -> pd.Series:
-    return x.rolling(window=window).std()
-
-def ts_sum(x: pd.Series, window: int) -> pd.Series:
-    return x.rolling(window=window).sum()
-
-def ts_max(x: pd.Series, window: int) -> pd.Series:
-    return x.rolling(window=window).max()
-
-def ts_min(x: pd.Series, window: int) -> pd.Series:
-    return x.rolling(window=window).min()
-
-def delta(x: pd.Series, lag: int) -> pd.Series:
-    return x.diff(lag)
-
-def delay(x: pd.Series, lag: int) -> pd.Series:
-    return x.shift(lag)
-
-def ts_rank(x: pd.Series, window: int) -> pd.Series:
-    return x.rolling(window).apply(lambda arr: (rankdata(arr)[-1] - 1) / (len(arr) - 1), raw=True)
-
-def decay_linear(x: pd.Series, window: int) -> pd.Series:
-    weights = np.arange(1, window + 1)
-    w = weights / weights.sum()
-    return x.rolling(window).apply(lambda arr: np.dot(arr, w), raw=True)
-
-def ts_corr(x: pd.Series, y: pd.Series, window: int) -> pd.Series:
-    return x.rolling(window).corr(y)
-
-def ts_cov(x: pd.Series, y: pd.Series, window: int) -> pd.Series:
-    return x.rolling(window).cov(y)
-
-def ts_skew(x: pd.Series, window: int) -> pd.Series:
-    return x.rolling(window).skew()
-
-def ts_kurt(x: pd.Series, window: int) -> pd.Series:
-    return x.rolling(window).kurt()
-
-# --- 新增/确认辅助算子 ---
-
-def ts_returns(x: pd.Series, lag: int = 1) -> pd.Series:
-    """计算收益率"""
-    return x.pct_change(lag)
+# ==============================================================================
+# 元素级算子 (Element-wise Operators)
+# ==============================================================================
 
 def log(x: pd.Series) -> pd.Series:
     """安全对数"""
     return np.log(np.abs(x) + 1e-9)
 
+def sign(x: pd.Series) -> pd.Series:
+    """符号函数"""
+    return np.sign(x)
+
 def abs_val(x: pd.Series) -> pd.Series:
     """绝对值"""
     return x.abs()
 
+def signed_power(x: pd.Series, e: float) -> pd.Series:
+    """保持符号的幂运算: sign(x) * |x|^e"""
+    return np.sign(x) * (np.abs(x) ** e)
+
+def scale(x: pd.Series, k: float = 1) -> pd.Series:
+    """缩放因子: 使得绝对值之和为 k"""
+    return x.mul(k).div(np.abs(x).sum() + 1e-9)
+
 # ==============================================================================
-# 截面与清洗算子 (保持不变)
+# 截面算子 (Cross-Sectional Operators)
 # ==============================================================================
 
 def cs_rank(x: pd.Series) -> pd.Series:
+    """截面排名 (百分比 0~1)"""
     return x.rank(pct=True)
 
-def cs_zscore(x: pd.Series) -> pd.Series:
-    return (x - x.mean()) / x.std()
-
-def winsorize(x: pd.Series, method: str = "mad", limits: tuple = (0.025, 0.025)) -> pd.Series:
+def winsorize(x: pd.Series, method: str = "mad") -> pd.Series:
+    """去极值 (MAD法)"""
     x_clean = x.copy()
     if method == "mad":
         median = x.median()
@@ -85,7 +54,68 @@ def winsorize(x: pd.Series, method: str = "mad", limits: tuple = (0.025, 0.025))
         x_clean = x_clean.clip(lower=lower, upper=upper)
     return x_clean
 
-def zscore(x: pd.Series, window: int) -> pd.Series:
-    mean = x.rolling(window).mean()
-    std = x.rolling(window).std()
+# ==============================================================================
+# 时间序列算子 (Rolling Time-Series Operators)
+# ==============================================================================
+
+def ts_mean(x: pd.Series, window) -> pd.Series:
+    return x.rolling(_to_int(window)).mean()
+
+def ts_std(x: pd.Series, window) -> pd.Series:
+    return x.rolling(_to_int(window)).std()
+
+def ts_sum(x: pd.Series, window) -> pd.Series:
+    return x.rolling(_to_int(window)).sum()
+
+def ts_max(x: pd.Series, window) -> pd.Series:
+    return x.rolling(_to_int(window)).max()
+
+def ts_min(x: pd.Series, window) -> pd.Series:
+    return x.rolling(_to_int(window)).min()
+
+def delta(x: pd.Series, lag) -> pd.Series:
+    return x.diff(_to_int(lag))
+
+def delay(x: pd.Series, lag) -> pd.Series:
+    return x.shift(_to_int(lag))
+
+def ts_corr(x: pd.Series, y: pd.Series, window) -> pd.Series:
+    return x.rolling(_to_int(window)).corr(y)
+
+def ts_cov(x: pd.Series, y: pd.Series, window) -> pd.Series:
+    return x.rolling(_to_int(window)).cov(y)
+
+def ts_skew(x: pd.Series, window) -> pd.Series:
+    return x.rolling(_to_int(window)).skew()
+
+def ts_kurt(x: pd.Series, window) -> pd.Series:
+    return x.rolling(_to_int(window)).kurt()
+
+def ts_rank(x: pd.Series, window) -> pd.Series:
+    """时间序列排名 (Rolling Rank)"""
+    w = _to_int(window)
+    def _rank_last(arr):
+        return (rankdata(arr)[-1] - 1) / (len(arr) - 1 + 1e-9)
+    return x.rolling(w).apply(_rank_last, raw=True)
+
+def ts_argmax(x: pd.Series, window) -> pd.Series:
+    """最大值所在的相对位置 (0 ~ window-1)"""
+    return x.rolling(_to_int(window)).apply(np.argmax, raw=True).astype(float)
+
+def ts_argmin(x: pd.Series, window) -> pd.Series:
+    """最小值所在的相对位置 (0 ~ window-1)"""
+    return x.rolling(_to_int(window)).apply(np.argmin, raw=True).astype(float)
+
+def decay_linear(x: pd.Series, window) -> pd.Series:
+    """线性衰减加权移动平均 (Weighted Moving Average)"""
+    w_size = _to_int(window)
+    weights = np.arange(1, w_size + 1)
+    w = weights / weights.sum()
+    return x.rolling(w_size).apply(lambda arr: np.dot(arr, w), raw=True)
+
+def zscore(x: pd.Series, window) -> pd.Series:
+    """Rolling Z-Score"""
+    w = _to_int(window)
+    mean = x.rolling(w).mean()
+    std = x.rolling(w).std()
     return (x - mean) / (std + 1e-9)

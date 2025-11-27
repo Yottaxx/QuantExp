@@ -5,7 +5,7 @@ from scipy.stats import spearmanr
 from .config import Config
 from .model import PatchTSTForStock, SotaConfig
 from .data_provider import get_dataset
-
+import os
 
 def compute_metrics(eval_pred):
     """
@@ -59,21 +59,37 @@ def run_training():
         per_device_train_batch_size=Config.BATCH_SIZE,
         per_device_eval_batch_size=Config.INFERENCE_BATCH_SIZE,
 
+        # --- [关键优化：配合 DataProvider 的 Lazy Mapping] ---
+        # 1. 开启多 worker 加速 IO
+        #    Linux 下建议设为 CPU 核数的一半，或 4-8
+        #    Windows 下建议保持 0 (因为没有 fork 机制，多进程会复制内存导致爆炸)
+        dataloader_num_workers=0 if os.name != 'nt' else 0,
+
+        # 2. 锁页内存，加速 CPU -> GPU 传输
+        dataloader_pin_memory=True,
+
+        # 3. 保持 worker 进程存活，避免每个 Epoch 重新创建进程的开销
+        dataloader_persistent_workers=True if os.name != 'nt' else False,
+        # ----------------------------------------------------
+
         learning_rate=Config.LR,
         weight_decay=1e-4,
         max_grad_norm=Config.MAX_GRAD_NORM,
 
         eval_strategy="steps",
-        eval_steps=1000,  # 每500步验证一次
+        eval_steps=500,  # 建议调小一点，观察验证集收敛
         save_steps=1000,
         save_total_limit=2,
 
-        logging_steps=100,
+        logging_steps=50,
         fp16=torch.cuda.is_available(),
-        dataloader_num_workers=0,
+
+        # 禁用 HF 默认的 remove_unused_columns，
+        # 因为我们的 Dataset 是动态生成的，没有物理列，防止 HF 误删
+        remove_unused_columns=False,
 
         load_best_model_at_end=True,
-        metric_for_best_model="ic",  # 监控 Validation Set 的 IC
+        metric_for_best_model="ic",
         greater_is_better=True,
         report_to="none"
     )
