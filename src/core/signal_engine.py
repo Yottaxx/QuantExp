@@ -170,3 +170,109 @@ class SignalEngine:
         df.loc[df["score"] < float(min_score_threshold), "score"] = -1
 
         return df.pivot(index="date", columns="code", values="score").sort_index()
+
+    @staticmethod
+    def score_latest_day(
+        *,
+        adjust: str,
+        mode: str,
+        top_k: int,
+        min_score_threshold: float,
+        batch_size: int,
+    ) -> Tuple[List[ScoredPick], Dict]:
+        """
+        对最新交易日做一次全市场打分 + 简单风控，返回:
+          - final_picks: 经过 regime/阈值过滤后的候选股 (ScoredPick 列表)
+          - meta: 附带 last_date/regime/mom/top_score/raw_topk 等元信息
+
+        设计上要与 inference.py 中 fallback 分支保持语义一致。
+        """
+        # 1) 加载模型和 panel
+        model = SignalEngine.load_model()
+        panel_df, feature_cols = SignalEngine.load_panel(adjust=adjust, mode=mode)
+
+        if panel_df.empty:
+            raise RuntimeError("panel_df empty (no data for scoring)")
+
+        # 2) 找到最新交易日
+        last_date = pd.to_datetime(panel_df["date"]).max().normalize()
+
+        # 3) 仅对 last_date 这一天做打分（要求 panel_df 内含足够 lookback）
+        scored = SignalEngine.score_date_range(
+            model=model,
+            panel_df=panel_df,
+            feature_cols=feature_cols,
+            start_date=last_date,
+            end_date=last_date,
+            seq_len=int(getattr(Config, "CONTEXT_LEN", 64)),
+            batch_size=int(batch_size),
+            desc="ScoringLatestDay",
+        )
+        if scored.empty:
+            raise RuntimeError("No scores produced for latest day (maybe insufficient lookback).")
+
+        scored["date"] = pd.to_datetime(scored["date"]).dt.normalize()
+        scored["code"] = scored["code"].astype(str)
+        scored["score"] = pd.to_numeric(scored["score"], errors="coerce").fillna(-1.0)
+
+        # 4) 绑定 PE(TTM)（如果有）
+        pe_map: Optional[Dict[str, float]] = None
+        if "pe_ttm" in panel_df.columns:
+            daily = panel_df[pd.to_datetime(panel_df["date"]).dt.normalize() == last_date][
+                ["code", "pe_ttm"]
+            ].copy()
+            daily["code"] = daily["code"].astype(str)
+            daily["pe_ttm"] = pd.to_numeric(daily["pe_ttm"], errors="coerce")
+            pe_map = (
+                daily.drop_duplicates("code", keep="last")
+                .set_index("code")["pe_ttm"]
+                .to_dict()
+            )
+
+        # 5) 市场状态（Bull/Bear/Shock）
+        regime, mom = SignalEngine.check_market_regime(panel_df, last_date)
+
+        # 6) 熊市均值过滤 + 分数阈值过滤
+        daily_mean = float(scored["score"].mean()) if len(scored) else -1.0
+        bear_th = float(getattr(Config, "BEAR_MEAN_THRESHOLD", 0.45))
+        if daily_mean < bear_th:
+            # 当日整体因子表现过差 -> 全部记为 -1，后续 TopK 只是方便展示
+            scored["score"] = -1.0
+
+        scored.loc[scored["score"] < float(min_score_threshold), "score"] = -1.0
+
+        # 7) raw_topk：按照 score 排序后的 TopK（用于展示）
+        sorted_df = scored.sort_values("score", ascending=False).head(int(top_k))
+        raw_topk: List[ScoredPick] = []
+        for _, r in sorted_df.iterrows():
+            code = str(r["code"])
+            s = float(r["score"])
+            pe_val = None
+            if pe_map is not None:
+                tmp = pe_map.get(code, None)
+                if tmp is not None and np.isfinite(tmp):
+                    pe_val = float(tmp)
+            raw_topk.append(ScoredPick(code=code, score=s, pe_ttm=pe_val))
+
+        top_score = float(raw_topk[0].score) if raw_topk else -1.0
+
+        # 8) final_picks：只保留“建议可买”的票（与你在 fallback 分支的逻辑一致）
+        final_picks: List[ScoredPick] = []
+        for p in raw_topk:
+            if regime == "Bear":
+                # 熊市模式：不建议买入（这里直接空）
+                continue
+            if p.score < float(min_score_threshold):
+                continue
+            final_picks.append(p)
+
+        meta: Dict = {
+            "last_date": last_date,
+            "regime": regime,
+            "mom": float(mom),
+            "top_score": top_score,
+            "raw_topk": raw_topk,        # inference 会自动转换成 tuple 方便展示
+            "daily_mean": daily_mean,
+            "bear_mean_th": bear_th,
+        }
+        return final_picks, meta
