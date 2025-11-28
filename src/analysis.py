@@ -201,7 +201,7 @@ class BacktestAnalyzer:
         read_start_date = start_incl - pd.Timedelta(days=lookback_buffer)
 
         # Price columns
-        needed_price_cols = ["date", "code", "open", "high", "low", "close", "volume","turnover"]
+        needed_price_cols = ["date", "code", "open", "high", "low", "close", "volume"]
         optional_price_cols = ["amount", "dollar_vol", "limit_rate", "tradable_mask", "buyable_mask", "sellable_mask"]
         keep_price_cols = [c for c in (needed_price_cols + optional_price_cols) if c in panel_df.columns]
 
@@ -319,7 +319,6 @@ class BacktestAnalyzer:
                 "high": pd.to_numeric(gg["high"], errors="coerce").values.astype(np.float64) if "high" in gg.columns else None,
                 "low": pd.to_numeric(gg["low"], errors="coerce").values.astype(np.float64) if "low" in gg.columns else None,
                 "close": pd.to_numeric(gg["close"], errors="coerce").values.astype(np.float64),
-                "turnover": pd.to_numeric(gg["turnover"], errors="coerce").values.astype(np.float64),
                 # 关键：mask 用 notna()，避免 bool(np.nan)==True
                 "buyable": gg["buyable_mask"].notna().values if "buyable_mask" in gg.columns else None,
                 "sellable": gg["sellable_mask"].notna().values if "sellable_mask" in gg.columns else None,

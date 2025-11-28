@@ -185,7 +185,6 @@ class SignalEngine:
           - final_picks: 经过 regime/阈值过滤后的候选股 (ScoredPick 列表)
           - meta: 附带 last_date/regime/mom/top_score/raw_topk 等元信息
 
-        设计上要与 inference.py 中 fallback 分支保持语义一致。
         """
         # 1) 加载模型和 panel
         model = SignalEngine.load_model()

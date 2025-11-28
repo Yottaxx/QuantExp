@@ -69,7 +69,7 @@ def _ensure_date_column(df: pd.DataFrame) -> pd.DataFrame:
 
 def _ensure_ohlcv_numeric(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    for col in ["open", "high", "low", "close", "volume","turnover"]:
+    for col in ["open", "high", "low", "close", "volume"]:
         if col not in df.columns:
             raise KeyError(f"Missing required column: {col}")
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -87,7 +87,7 @@ def _prepare_bt_price_df(
 
     统一逻辑：
       - 路径: DataProvider._price_dir(DataProvider._norm_adjust(adjust))
-      - 列: 至少包含 date/open/high/low/close/volume/turnover
+      - 列: 至少包含 date/open/high/low/close/volume
       - 计算: 若无 dollar_vol 列，生成 (close * volume)
       - mask: DataProvider._add_trade_masks(df) -> tradable/buyable/sellable (用 NaN 表示不可交易)
       - 索引: DatetimeIndex(date)
@@ -158,7 +158,6 @@ class AShareDataFeed(bt.feeds.PandasData):
         ("low", "low"),
         ("close", "close"),
         ("volume", "volume"),
-        ("turnover", "turnover"),
         ("openinterest", -1),
         ("tradable", "tradable_mask"),
         ("buyable", "buyable_mask"),
