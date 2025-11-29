@@ -64,8 +64,8 @@ def run_training():
         max_grad_norm=Config.MAX_GRAD_NORM,
 
         eval_strategy="steps",
-        eval_steps=1000,  # 每500步验证一次
-        save_steps=1000,
+        eval_steps=500,  # 每500步验证一次
+        save_steps=500,
         save_total_limit=2,
 
         logging_steps=100,
@@ -84,7 +84,7 @@ def run_training():
         train_dataset=ds['train'],  # 训练集
         eval_dataset=ds['validation'],  # 验证集 (Eval Set)
         compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]
+        # callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]
     )
 
     print(f"🚀 开始训练...")

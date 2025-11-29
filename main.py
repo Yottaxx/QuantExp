@@ -19,19 +19,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SOTA Quant System v8.3 (Fixed)")
 
     # 增加 test 和 debug_proxy 模式
-    parser.add_argument('--mode', type=str, required=False,default="analysis",
+    parser.add_argument('--mode', type=str, required=False,default="predict",
                         choices=['download', 'train', 'predict', 'analysis', 'backtest', 'test', 'debug_proxy'],
                         help='运行模式: [download|train|predict|analysis|backtest|test|debug_proxy]')
 
-    parser.add_argument('--cash', type=float, default=1000000.0, help='回测初始资金')
+    parser.add_argument('--cash', type=float, default=500000.0, help='回测初始资金')
     parser.add_argument('--top_k', type=int, default=Config.TOP_K, help='持仓数量')
 
-    parser.add_argument('--start_date', type=str, default='2024-01-01', help='开始日期')
-    parser.add_argument('--end_date', type=str, default='2025-12-31', help='结束日期')
+    parser.add_argument('--start_date', type=str, default=Config.START_DATE, help='开始日期')
+    parser.add_argument('--end_date', type=str, default=Config.END_DATE, help='结束日期')
 
     parser.add_argument('--force_refresh', action='store_true', help='强制重新生成缓存')
-    parser.add_argument('--mse_weight', type=float, default=0.5, help='Loss中MSE的权重')
-    parser.add_argument('--dropout', type=float, default=0.2, help='模型Dropout比率')
+    parser.add_argument('--mse_weight', type=float, default=Config.MSE_WEIGHT, help='Loss中MSE的权重')
+    parser.add_argument('--dropout', type=float, default=Config.DROPOUT, help='模型Dropout比率')
 
     args = parser.parse_args()
 
@@ -84,6 +84,6 @@ if __name__ == "__main__":
         )
 
     elif args.mode == 'analysis':
-        an = BacktestAnalyzer(target_set='eval')
+        an = BacktestAnalyzer(target_set='test')
         an.generate_historical_predictions()
         an.analyze_performance()

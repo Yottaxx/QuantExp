@@ -36,14 +36,17 @@ class DataProvider:
 
     @classmethod
     def _safe_switch_vpn(cls):
+        """线程安全的 VPN 切换逻辑"""
         with cls._vpn_lock:
+            # 防止多个线程同时触发过于频繁的切换，冷却时间 5秒
             if time.time() - cls._last_switch_time < 5: return
             try:
+                print("🔄 [Network] 正在切换 IP线路 ...")
                 vpn_rotator.switch_random()
-            except:
-                pass
+            except Exception as e:
+                print(f"⚠️ VPN 切换异常: {e}")
             cls._last_switch_time = time.time()
-            time.sleep(2)
+            time.sleep(3)  # 等待网络稳定
 
     @staticmethod
     def _get_latest_trading_date():
@@ -157,12 +160,33 @@ class DataProvider:
         DataProvider._setup_proxy_env()
         if not os.path.exists(Config.DATA_DIR): os.makedirs(Config.DATA_DIR)
 
-        try:
-            stock_info = ak.stock_zh_a_spot_em()
-            codes = stock_info['代码'].tolist()
-        except:
-            print("❌ 无法获取股票列表")
+        # --- [Modification Start] 获取股票列表添加重试与VPN切换逻辑 ---
+        codes = []
+        max_retries = 10
+        print("正在获取最新全市场股票列表...")
+
+        for attempt in range(max_retries):
+            try:
+                # 尝试获取数据
+                stock_info = ak.stock_zh_a_spot_em()
+                if stock_info is not None and not stock_info.empty:
+                    codes = stock_info['代码'].tolist()
+                    print(f"✅ 成功获取股票列表，共 {len(codes)} 只。")
+                    break
+                else:
+                    raise ValueError("返回数据为空")
+
+            except Exception as e:
+                print(f"⚠️ [Attempt {attempt + 1}/{max_retries}] 获取股票列表失败: {e}")
+                # 触发VPN切换
+                DataProvider._safe_switch_vpn()
+                # 随机等待，避免切换后立即请求又被封
+                time.sleep(random.uniform(2, 5))
+
+        if not codes:
+            print("❌ 严重错误：经过多次重试仍无法获取股票列表，ETL 终止。")
             return
+        # --- [Modification End] ---
 
         target_date_str = DataProvider._get_latest_trading_date()
         existing_fresh = set()
@@ -179,6 +203,7 @@ class DataProvider:
         print(f"📊 股票池总数: {len(codes)} | 待更新: {len(todo_price)}")
 
         if todo_price:
+            # 这里的线程数可以根据网络带宽和代理稳定性适当调整
             with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
                 futures = {executor.submit(DataProvider._download_worker, c): c for c in todo_price}
                 for _ in tqdm(concurrent.futures.as_completed(futures), total=len(todo_price),
@@ -198,28 +223,15 @@ class DataProvider:
 
     @staticmethod
     def _tag_universe(panel_df):
-        """
-        [CRITICAL FIX] 标记 Universe，彻底修复未来数据泄漏
-        原逻辑 transform('count') 会导致 2020 年知道 2024 年该股票还活着。
-        新逻辑 cumcount() 仅统计截至当天的上市天数。
-        """
         print(">>> [Tagging] 标记动态股票池 (Universe Mask)...")
-
-        # 1. 必须确保按日期排序
         panel_df = panel_df.sort_values(['code', 'date'])
-
-        # 2. 使用 expanding count (cumcount) 统计累计上市天数
         panel_df['list_days_count'] = panel_df.groupby('code')['date'].cumcount() + 1
 
-        # 3. 筛选条件
         cond_vol = panel_df['volume'] > 0
         cond_price = panel_df['close'] >= 2.0
-        # 必须上市超过 60 天才纳入 (严格剔除次新股)
         cond_list = panel_df['list_days_count'] > 60
 
         panel_df['is_universe'] = cond_vol & cond_price & cond_list
-
-        # 清理临时列
         panel_df.drop(columns=['list_days_count'], inplace=True)
 
         valid_count = panel_df['is_universe'].sum()
@@ -229,10 +241,6 @@ class DataProvider:
 
     @staticmethod
     def load_and_process_panel(mode='train', force_refresh=False):
-        """
-        加载并处理面板数据 (计算因子、标签、截面处理)
-        mode='train' 表示加载带 Label 的全量数据，并不代表只加载训练集
-        """
         cache_path = DataProvider._get_cache_path(mode)
         if not force_refresh and os.path.exists(cache_path):
             print(f"⚡️ [Cache Hit] {cache_path}")
@@ -265,9 +273,8 @@ class DataProvider:
         del data_frames
 
         panel_df['code'] = panel_df['code'].astype(str)
-        panel_df['date'] = pd.to_datetime(panel_df['index'] if 'index' in panel_df.columns else panel_df['date'])
+        panel_df['date'] = pd.to_datetime(panel_df['date'])
 
-        # 读取财务并进行 PIT 合并
         fund_files = glob.glob(os.path.join(fund_dir, "*.parquet"))
 
         def _read_fund(f):
@@ -285,7 +292,6 @@ class DataProvider:
             fund_df = pd.concat(fund_frames)
             fund_df = fund_df.reset_index().sort_values(['code', 'date'])
 
-            # 使用公告日对齐
             if 'pub_date' in fund_df.columns:
                 fund_df['merge_date'] = fund_df['pub_date']
                 mask_na = fund_df['merge_date'].isna()
@@ -320,7 +326,6 @@ class DataProvider:
         if mode == 'train':
             panel_df.dropna(subset=['target'], inplace=True)
 
-        # [修复] 标记 Universe
         panel_df = DataProvider._tag_universe(panel_df)
 
         print("计算截面因子与标准化...")
@@ -338,9 +343,6 @@ class DataProvider:
 
     @staticmethod
     def make_dataset(panel_df, feature_cols):
-        """
-        [CRITICAL UPDATE] 实现 Train/Valid/Test 三段式严格切分，带 Gap 防止泄漏
-        """
         print(">>> [Dataset] 转换张量格式 (Train/Valid/Test Split)...")
         panel_df = panel_df.sort_values(['code', 'date']).reset_index(drop=True)
 
@@ -354,7 +356,6 @@ class DataProvider:
         dates = panel_df['date'].values
         codes = panel_df['code'].values
 
-        # 1. 生成滑动窗口索引
         code_changes = np.where(codes[:-1] != codes[1:])[0] + 1
         start_indices = np.concatenate(([0], code_changes))
         end_indices = np.concatenate((code_changes, [len(codes)]))
@@ -371,24 +372,17 @@ class DataProvider:
 
         valid_indices = np.array(valid_indices)
 
-        # 2. 基于时间的切分 (Train / Valid / Test)
         unique_dates = np.sort(np.unique(dates))
         n_dates = len(unique_dates)
 
-        # Config 中定义了 TRAIN_RATIO (0.8), VAL_RATIO (0.1), TEST_RATIO (0.1)
         train_end_idx = int(n_dates * Config.TRAIN_RATIO)
         val_end_idx = int(n_dates * (Config.TRAIN_RATIO + Config.VAL_RATIO))
 
-        # 切分日期点
         train_date_limit = unique_dates[train_end_idx]
-
-        # Gap: 防止 Train 尾部样本看到 Valid 头部样本的未来
-        # Valid Start = Train End + Context Length
         val_start_idx = min(train_end_idx + Config.CONTEXT_LEN, n_dates - 1)
         val_start_date = unique_dates[val_start_idx]
         val_date_limit = unique_dates[val_end_idx]
 
-        # Test Start = Valid End + Context Length
         test_start_idx = min(val_end_idx + Config.CONTEXT_LEN, n_dates - 1)
         test_start_date = unique_dates[test_start_idx]
 
@@ -397,10 +391,8 @@ class DataProvider:
         print(f"   Valid : {val_start_date} ~ {val_date_limit}")
         print(f"   Test  : {test_start_date} ~ {unique_dates[-1]}")
 
-        # 获取样本对应的预测时间点
         sample_pred_dates = dates[valid_indices + seq_len - 1]
 
-        # 生成 Mask
         train_mask = sample_pred_dates < train_date_limit
         valid_mask = (sample_pred_dates >= val_start_date) & (sample_pred_dates < val_date_limit)
         test_mask = sample_pred_dates >= test_start_date
@@ -411,7 +403,6 @@ class DataProvider:
 
         print(f"   样本数 : Train={len(idx_train)}, Valid={len(idx_valid)}, Test={len(idx_test)}")
 
-        # 3. 生成器工厂
         def create_gen(indices, shuffle=False):
             def _gen():
                 if shuffle: np.random.shuffle(indices)
@@ -421,10 +412,8 @@ class DataProvider:
                         "past_values": feature_matrix[start_idx: end_idx],
                         "labels": target_array[end_idx - 1]
                     }
-
             return _gen
 
-        # 4. 返回 DatasetDict
         ds = DatasetDict({
             'train': Dataset.from_generator(create_gen(idx_train, shuffle=True)),
             'validation': Dataset.from_generator(create_gen(idx_valid, shuffle=False)),
@@ -432,9 +421,7 @@ class DataProvider:
         })
         return ds, len(feature_cols)
 
-
 def get_dataset(force_refresh=False):
-    """对外接口"""
     panel_df, feature_cols = DataProvider.load_and_process_panel(mode='train', force_refresh=force_refresh)
     ds, num_features = DataProvider.make_dataset(panel_df, feature_cols)
     return ds, num_features

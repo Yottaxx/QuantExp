@@ -14,7 +14,8 @@ class Config:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # --- 数据参数 ---
-    START_DATE = "20200101"
+    START_DATE = "20240101"
+    END_DATE = "20251101"
 
     # [CRITICAL UPDATE] 数据集划分比例 (Train / Valid / Test)
     # Valid 用于 Training 过程中的 Early Stopping
@@ -25,8 +26,8 @@ class Config:
 
     # --- 网络配置 ---
     PROXY_URL = "http://127.0.0.1:7890"
-    CLASH_API_URL = "http://127.0.0.1:9090"
-    CLASH_SECRET = ""
+    CLASH_API_URL = "http://127.0.0.1:56316"
+    CLASH_SECRET = "132d9501-074c-4515-ad58-2180cbb58536"
 
     BENCHMARK_SYMBOL = "sh000300"
     MARKET_INDEX_SYMBOL = "sh000001"
@@ -39,23 +40,22 @@ class Config:
     SEED = 42
 
     # --- 模型参数 ---
-    CONTEXT_LEN = 64
+    CONTEXT_LEN = 128
     PRED_LEN = 5
     PATCH_LEN = 8
     STRIDE = 4
     DROPOUT = 0.2
-    d_model = 128
-    D_MODEL = 128
+    D_MODEL = 32
 
     # --- 训练参数 ---
-    BATCH_SIZE = 128
-    EPOCHS = 20
-    LR = 1e-4
+    BATCH_SIZE = 256
+    EPOCHS = 3
+    LR = 1e-5
     MSE_WEIGHT = 0.5
     MAX_GRAD_NORM = 1.0
 
     # --- 推理与风控 ---
-    INFERENCE_BATCH_SIZE = 256
+    INFERENCE_BATCH_SIZE = 512
     ANALYSIS_BATCH_SIZE = 2048
     MIN_SCORE_THRESHOLD = 0.6
     TOP_K = 5

@@ -303,7 +303,7 @@ if __name__ == "__main__":
     # analyzer.analyze_performance()
 
     # 2. 分析验证集 (Eval Set - 检查是否过拟合)
-    print(">>> Mode: Eval Set")
+    print(">>> Mode: Test Set")
     analyzer = BacktestAnalyzer(target_set='eval')
     analyzer.generate_historical_predictions()
     analyzer.analyze_performance()

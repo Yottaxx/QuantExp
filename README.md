@@ -53,7 +53,7 @@ graph TD
 
 环境配置 (Installation)
 1. Python 依赖
-pip install torch transformers datasets pandas numpy scipy scikit-learn akshare backtrader matplotlib tqdm requests pysocks
+pip install torch transformers datasets pandas numpy scipy scikit-learn akshare backtrader matplotlib tqdm requests pysocks pandarallel accelerate
 
 
 2. 网络代理配置 (必须)
