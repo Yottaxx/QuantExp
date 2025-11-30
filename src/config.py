@@ -14,9 +14,9 @@ class Config:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # --- 数据参数 ---
-    START_DATE = "20240101"
-    END_DATE = "20251101"
-
+    START_DATE = "20010101"
+    END_DATE = "20251128"
+    TARGET_DATE = "20251017"
     # [CRITICAL UPDATE] 数据集划分比例 (Train / Valid / Test)
     # Valid 用于 Training 过程中的 Early Stopping
     # Test 用于 Analysis 和 Backtest (完全隔离)
@@ -51,7 +51,7 @@ class Config:
     BATCH_SIZE = 256
     EPOCHS = 3
     LR = 1e-5
-    MSE_WEIGHT = 0.5
+    MSE_WEIGHT = 0.2
     MAX_GRAD_NORM = 1.0
 
     # --- 推理与风控 ---

@@ -217,9 +217,20 @@ class DataProvider:
         print("✅ 数据同步完成。")
 
     @staticmethod
-    def _get_cache_path(mode):
+    def _get_cache_path(mode, end_date=None):
+        """
+        [Updated] 缓存路径包含截止日期，防止不同日期的预测混用缓存
+        """
         today_str = datetime.date.today().strftime("%Y%m%d")
-        return os.path.join(Config.OUTPUT_DIR, f"panel_cache_{mode}_{today_str}.pkl")
+        end_date_str = "latest"
+        if end_date:
+            # 确保 end_date 转为字符串格式 (YYYYMMDD)
+            if isinstance(end_date, str):
+                end_date_str = end_date.replace("-", "")
+            elif isinstance(end_date, (datetime.date, datetime.datetime, pd.Timestamp)):
+                end_date_str = end_date.strftime("%Y%m%d")
+
+        return os.path.join(Config.OUTPUT_DIR, f"panel_cache_{mode}_{end_date_str}_{today_str}.pkl")
 
     @staticmethod
     def _tag_universe(panel_df):
@@ -240,14 +251,17 @@ class DataProvider:
         return panel_df
 
     @staticmethod
-    def load_and_process_panel(mode='train', force_refresh=False):
-        cache_path = DataProvider._get_cache_path(mode)
+    def load_and_process_panel(mode='train', end_date=None, force_refresh=False):
+        """
+        [Updated] 支持指定 end_date，实现严格的时间截断
+        """
+        cache_path = DataProvider._get_cache_path(mode, end_date)
         if not force_refresh and os.path.exists(cache_path):
             print(f"⚡️ [Cache Hit] {cache_path}")
             with open(cache_path, 'rb') as f:
                 return pickle.load(f)
 
-        print(f"\n>>> [Processing] 构建 Panel 数据 (Mode: {mode})...")
+        print(f"\n>>> [Processing] 构建 Panel 数据 (Mode: {mode}, EndDate: {end_date if end_date else 'Latest'})...")
         price_files = glob.glob(os.path.join(Config.DATA_DIR, "*.parquet"))
         fund_dir = os.path.join(Config.DATA_DIR, "fundamental")
 
@@ -266,7 +280,8 @@ class DataProvider:
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             results = list(tqdm(executor.map(_read_price, price_files), total=len(price_files), desc="Reading Price"))
 
-        data_frames = [df for df in results if df is not None and len(df) > Config.CONTEXT_LEN]
+        # 初步过滤长度不够的，但如果是指定日期预测，这里先不过滤长度，合并后再裁切
+        data_frames = [df for df in results if df is not None and not df.empty]
         if not data_frames: raise ValueError("没有足够的有效行情数据，请先运行 download_data()")
 
         panel_df = pd.concat(data_frames, ignore_index=True)
@@ -275,6 +290,17 @@ class DataProvider:
         panel_df['code'] = panel_df['code'].astype(str)
         panel_df['date'] = pd.to_datetime(panel_df['date'])
 
+        # --- [CRITICAL] Time Travel Prevention ---
+        # 如果指定了 end_date，在任何因子计算之前必须截断数据
+        if end_date is not None:
+            cutoff_dt = pd.to_datetime(end_date)
+            print(f"✂️ 执行时间截断: 仅保留 {cutoff_dt.date()} 及之前的数据")
+            panel_df = panel_df[panel_df['date'] <= cutoff_dt]
+            if panel_df.empty:
+                raise ValueError(f"截断后数据为空 (end_date={end_date})")
+        # -----------------------------------------
+
+        # 读取财务并进行 PIT 合并
         fund_files = glob.glob(os.path.join(fund_dir, "*.parquet"))
 
         def _read_fund(f):
@@ -295,6 +321,7 @@ class DataProvider:
             if 'pub_date' in fund_df.columns:
                 fund_df['merge_date'] = fund_df['pub_date']
                 mask_na = fund_df['merge_date'].isna()
+                # 财务数据填充逻辑...
                 report_months = fund_df.loc[mask_na, 'date'].dt.month
                 delays = report_months.apply(lambda m: 120 if m == 12 else 60)
                 fund_df.loc[mask_na, 'merge_date'] = fund_df.loc[mask_na, 'date'] + pd.to_timedelta(delays, unit='D')
@@ -303,6 +330,10 @@ class DataProvider:
 
             fund_df = fund_df.drop(columns=['date', 'pub_date'], errors='ignore')
             fund_df.rename(columns={'merge_date': 'date'}, inplace=True)
+
+            # 同样对财务数据做截断，虽然 merge_asof 会处理，但为了效率
+            if end_date is not None:
+                fund_df = fund_df[fund_df['date'] <= pd.to_datetime(end_date)]
 
             panel_df = panel_df.reset_index().sort_values(['code', 'date'])
             panel_df = pd.merge_asof(panel_df, fund_df, on='date', by='code', direction='backward')
@@ -315,9 +346,12 @@ class DataProvider:
         panel_df = panel_df.reset_index().sort_values(['code', 'date'])
 
         print("计算时序因子...")
+        # 此时 panel_df 已经不包含 future data，计算滚动因子是安全的
         panel_df = panel_df.groupby('code', group_keys=False).parallel_apply(lambda x: AlphaFactory(x).make_factors())
 
         print("构造预测目标 (Labels)...")
+        # 即使是 predict 模式，计算 label 也无妨（如果有未来数据），后续通过 universe 过滤
+        # 但如果是指定日期的 predict，最后几天 label 会是 NaN，这符合预期
         panel_df['next_open'] = panel_df.groupby('code')['open'].shift(-1)
         panel_df['future_close'] = panel_df.groupby('code')['close'].shift(-Config.PRED_LEN)
         panel_df['target'] = panel_df['future_close'] / panel_df['next_open'] - 1

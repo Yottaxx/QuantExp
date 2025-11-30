@@ -19,7 +19,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SOTA Quant System v8.3 (Fixed)")
 
     # 增加 test 和 debug_proxy 模式
-    parser.add_argument('--mode', type=str, required=False,default="predict",
+    parser.add_argument('--mode', type=str, required=False,default="train",
                         choices=['download', 'train', 'predict', 'analysis', 'backtest', 'test', 'debug_proxy'],
                         help='运行模式: [download|train|predict|analysis|backtest|test|debug_proxy]')
 
@@ -28,6 +28,8 @@ if __name__ == "__main__":
 
     parser.add_argument('--start_date', type=str, default=Config.START_DATE, help='开始日期')
     parser.add_argument('--end_date', type=str, default=Config.END_DATE, help='结束日期')
+
+    parser.add_argument('--target_date', type=str, default=Config.TARGET_DATE, help='结束日期')
 
     parser.add_argument('--force_refresh', action='store_true', help='强制重新生成缓存')
     parser.add_argument('--mse_weight', type=float, default=Config.MSE_WEIGHT, help='Loss中MSE的权重')
@@ -69,7 +71,7 @@ if __name__ == "__main__":
                 print(f"清理旧缓存: {p}")
                 os.remove(p)
 
-        top_stocks = run_inference(top_k=args.top_k)
+        top_stocks = run_inference(top_k=args.top_k,target_date=args.target_date)
 
         # 预测后自动跑一次简单回测验证
         if top_stocks:
