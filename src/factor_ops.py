@@ -1,121 +1,193 @@
-import pandas as pd
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import numpy as np
+import pandas as pd
 from scipy.stats import rankdata
 
-# ==============================================================================
-# 基础辅助函数 (Helper Functions)
-# ==============================================================================
 
-def _to_int(n):
-    """将窗口参数强制转为整数 (兼容 WQ 公式中的浮点窗口)"""
+def _to_int(n) -> int:
     return int(round(n))
 
+
+def _as_by(by, like: pd.Series) -> pd.Series | None:
+    if by is None:
+        return None
+    if isinstance(by, str):
+        raise TypeError("factor_ops: `by` must be a Series (e.g. df['code']), not a column name string.")
+    by = pd.Series(by)
+    if len(by) != len(like):
+        raise ValueError("factor_ops: `by` length mismatch.")
+    return by
+
+
+def _drop_gb_index(s: pd.Series) -> pd.Series:
+    return s.reset_index(level=0, drop=True) if isinstance(s.index, pd.MultiIndex) else s
+
+
 # ==============================================================================
-# 元素级算子 (Element-wise Operators)
+# Element-wise
 # ==============================================================================
 
-def log(x: pd.Series) -> pd.Series:
-    """安全对数"""
+def log_abs(x: pd.Series) -> pd.Series:
+    """WQ兼容：log(abs(x)). 仅在确实需要时用；收益率等不要用它。"""
+    x = pd.to_numeric(x, errors="coerce")
     return np.log(np.abs(x) + 1e-9)
 
+
+def log1p_pos(x: pd.Series) -> pd.Series:
+    """推荐：对非负量纲特征（amount/volume/dv）使用 log1p."""
+    x = pd.to_numeric(x, errors="coerce")
+    return np.log1p(x.clip(lower=0))
+
+
 def sign(x: pd.Series) -> pd.Series:
-    """符号函数"""
-    return np.sign(x)
+    return np.sign(pd.to_numeric(x, errors="coerce"))
+
 
 def abs_val(x: pd.Series) -> pd.Series:
-    """绝对值"""
-    return x.abs()
+    return pd.to_numeric(x, errors="coerce").abs()
+
 
 def signed_power(x: pd.Series, e: float) -> pd.Series:
-    """保持符号的幂运算: sign(x) * |x|^e"""
+    x = pd.to_numeric(x, errors="coerce")
     return np.sign(x) * (np.abs(x) ** e)
 
-def scale(x: pd.Series, k: float = 1) -> pd.Series:
-    """缩放因子: 使得绝对值之和为 k"""
-    return x.mul(k).div(np.abs(x).sum() + 1e-9)
 
 # ==============================================================================
-# 截面算子 (Cross-Sectional Operators)
+# Cross-sectional (配合 groupby(date).transform 使用)
 # ==============================================================================
 
 def cs_rank(x: pd.Series) -> pd.Series:
-    """截面排名 (百分比 0~1)"""
     return x.rank(pct=True)
 
-def winsorize(x: pd.Series, method: str = "mad") -> pd.Series:
-    """去极值 (MAD法)"""
-    x_clean = x.copy()
-    if method == "mad":
-        median = x.median()
-        mad = (x - median).abs().median()
-        sigma = mad * 1.4826
-        lower = median - 3 * sigma
-        upper = median + 3 * sigma
-        x_clean = x_clean.clip(lower=lower, upper=upper)
-    return x_clean
 
 # ==============================================================================
-# 时间序列算子 (Rolling Time-Series Operators)
+# Time-series (panel-safe via `by`)
 # ==============================================================================
 
-def ts_mean(x: pd.Series, window) -> pd.Series:
-    return x.rolling(_to_int(window)).mean()
-
-def ts_std(x: pd.Series, window) -> pd.Series:
-    return x.rolling(_to_int(window)).std()
-
-def ts_sum(x: pd.Series, window) -> pd.Series:
-    return x.rolling(_to_int(window)).sum()
-
-def ts_max(x: pd.Series, window) -> pd.Series:
-    return x.rolling(_to_int(window)).max()
-
-def ts_min(x: pd.Series, window) -> pd.Series:
-    return x.rolling(_to_int(window)).min()
-
-def delta(x: pd.Series, lag) -> pd.Series:
-    return x.diff(_to_int(lag))
-
-def delay(x: pd.Series, lag) -> pd.Series:
-    return x.shift(_to_int(lag))
-
-def ts_corr(x: pd.Series, y: pd.Series, window) -> pd.Series:
-    return x.rolling(_to_int(window)).corr(y)
-
-def ts_cov(x: pd.Series, y: pd.Series, window) -> pd.Series:
-    return x.rolling(_to_int(window)).cov(y)
-
-def ts_skew(x: pd.Series, window) -> pd.Series:
-    return x.rolling(_to_int(window)).skew()
-
-def ts_kurt(x: pd.Series, window) -> pd.Series:
-    return x.rolling(_to_int(window)).kurt()
-
-def ts_rank(x: pd.Series, window) -> pd.Series:
-    """时间序列排名 (Rolling Rank)"""
+def ts_mean(x: pd.Series, window, by=None, min_periods: int | None = 1) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce")
     w = _to_int(window)
-    def _rank_last(arr):
-        return (rankdata(arr)[-1] - 1) / (len(arr) - 1 + 1e-9)
-    return x.rolling(w).apply(_rank_last, raw=True)
+    by = _as_by(by, x)
+    out = x.rolling(w, min_periods=min_periods).mean() if by is None else x.groupby(by, sort=False).rolling(w, min_periods=min_periods).mean()
+    return _drop_gb_index(out)
 
-def ts_argmax(x: pd.Series, window) -> pd.Series:
-    """最大值所在的相对位置 (0 ~ window-1)"""
-    return x.rolling(_to_int(window)).apply(np.argmax, raw=True).astype(float)
 
-def ts_argmin(x: pd.Series, window) -> pd.Series:
-    """最小值所在的相对位置 (0 ~ window-1)"""
-    return x.rolling(_to_int(window)).apply(np.argmin, raw=True).astype(float)
-
-def decay_linear(x: pd.Series, window) -> pd.Series:
-    """线性衰减加权移动平均 (Weighted Moving Average)"""
-    w_size = _to_int(window)
-    weights = np.arange(1, w_size + 1)
-    w = weights / weights.sum()
-    return x.rolling(w_size).apply(lambda arr: np.dot(arr, w), raw=True)
-
-def zscore(x: pd.Series, window) -> pd.Series:
-    """Rolling Z-Score"""
+def ts_std(x: pd.Series, window, by=None, min_periods: int | None = 1) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce")
     w = _to_int(window)
-    mean = x.rolling(w).mean()
-    std = x.rolling(w).std()
-    return (x - mean) / (std + 1e-9)
+    by = _as_by(by, x)
+    out = x.rolling(w, min_periods=min_periods).std() if by is None else x.groupby(by, sort=False).rolling(w, min_periods=min_periods).std()
+    return _drop_gb_index(out)
+
+
+def ts_sum(x: pd.Series, window, by=None, min_periods: int | None = 1) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce")
+    w = _to_int(window)
+    by = _as_by(by, x)
+    out = x.rolling(w, min_periods=min_periods).sum() if by is None else x.groupby(by, sort=False).rolling(w, min_periods=min_periods).sum()
+    return _drop_gb_index(out)
+
+
+def ts_max(x: pd.Series, window, by=None, min_periods: int | None = 1) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce")
+    w = _to_int(window)
+    by = _as_by(by, x)
+    out = x.rolling(w, min_periods=min_periods).max() if by is None else x.groupby(by, sort=False).rolling(w, min_periods=min_periods).max()
+    return _drop_gb_index(out)
+
+
+def ts_min(x: pd.Series, window, by=None, min_periods: int | None = 1) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce")
+    w = _to_int(window)
+    by = _as_by(by, x)
+    out = x.rolling(w, min_periods=min_periods).min() if by is None else x.groupby(by, sort=False).rolling(w, min_periods=min_periods).min()
+    return _drop_gb_index(out)
+
+
+def delay(x: pd.Series, lag, by=None) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce")
+    l = _to_int(lag)
+    by = _as_by(by, x)
+    return x.shift(l) if by is None else x.groupby(by, sort=False).shift(l)
+
+
+def delta(x: pd.Series, lag, by=None) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce")
+    l = _to_int(lag)
+    by = _as_by(by, x)
+    return x.diff(l) if by is None else x.groupby(by, sort=False).diff(l)
+
+
+def ewm_mean(x: pd.Series, span: int, by=None, adjust: bool = False) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce")
+    by = _as_by(by, x)
+    if by is None:
+        return x.ewm(span=span, adjust=adjust).mean()
+    out = x.groupby(by, sort=False).ewm(span=span, adjust=adjust).mean()
+    return _drop_gb_index(out)
+
+
+def ts_cov(x: pd.Series, y: pd.Series, window, by=None, min_periods: int | None = 1) -> pd.Series:
+    """cov(x,y)=E[xy]-E[x]E[y]，比 rolling.cov 更稳定（panel安全）"""
+    x = pd.to_numeric(x, errors="coerce")
+    y = pd.to_numeric(y, errors="coerce")
+    if len(x) != len(y):
+        raise ValueError("ts_cov: x/y length mismatch")
+    w = _to_int(window)
+    by = _as_by(by, x)
+
+    if by is None:
+        ex = x.rolling(w, min_periods=min_periods).mean()
+        ey = y.rolling(w, min_periods=min_periods).mean()
+        exy = (x * y).rolling(w, min_periods=min_periods).mean()
+        return exy - ex * ey
+
+    ex = _drop_gb_index(x.groupby(by, sort=False).rolling(w, min_periods=min_periods).mean())
+    ey = _drop_gb_index(y.groupby(by, sort=False).rolling(w, min_periods=min_periods).mean())
+    exy = _drop_gb_index((x * y).groupby(by, sort=False).rolling(w, min_periods=min_periods).mean())
+    return exy - ex * ey
+
+
+def ts_corr(x: pd.Series, y: pd.Series, window, by=None, min_periods: int | None = 1) -> pd.Series:
+    cov = ts_cov(x, y, window, by=by, min_periods=min_periods)
+    sx = ts_std(x, window, by=by, min_periods=min_periods)
+    sy = ts_std(y, window, by=by, min_periods=min_periods)
+    return cov / (sx * sy + 1e-9)
+
+
+def ts_skew(x: pd.Series, window, by=None, min_periods: int | None = 1) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce")
+    w = _to_int(window)
+    by = _as_by(by, x)
+    out = x.rolling(w, min_periods=min_periods).skew() if by is None else x.groupby(by, sort=False).rolling(w, min_periods=min_periods).skew()
+    return _drop_gb_index(out)
+
+
+def ts_kurt(x: pd.Series, window, by=None, min_periods: int | None = 1) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce")
+    w = _to_int(window)
+    by = _as_by(by, x)
+    out = x.rolling(w, min_periods=min_periods).kurt() if by is None else x.groupby(by, sort=False).rolling(w, min_periods=min_periods).kurt()
+    return _drop_gb_index(out)
+
+
+def ts_rank(x: pd.Series, window, by=None, min_periods: int | None = None) -> pd.Series:
+    """rolling rank of last element in window -> [0,1]. 注意：rolling.apply 偏慢"""
+    x = pd.to_numeric(x, errors="coerce")
+    w = _to_int(window)
+    mp = w if min_periods is None else min_periods
+    by = _as_by(by, x)
+
+    def _rank_last(arr: np.ndarray) -> float:
+        n = len(arr)
+        if n <= 1:
+            return 0.0
+        return float((rankdata(arr)[-1] - 1) / (n - 1 + 1e-9))
+
+    if by is None:
+        return x.rolling(w, min_periods=mp).apply(_rank_last, raw=True)
+
+    out = x.groupby(by, sort=False).rolling(w, min_periods=mp).apply(_rank_last, raw=True)
+    return _drop_gb_index(out)
