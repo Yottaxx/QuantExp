@@ -84,7 +84,7 @@ class DataProvider:
     # -------- public API --------
     def download_data(self, adjusts: Optional[List[str]] = None) -> None:
         # Price is the main dependency (universe/security master inferred from it).
-        # self.price_pipeline.download_data(adjusts=adjusts)
+        self.price_pipeline.download_data(adjusts=adjusts)
         # Extra streams are optional and cached by TTL.
         try:
             target_dt = self.calendar.latest_trade_date()
@@ -93,7 +93,7 @@ class DataProvider:
         except Exception:
             codes = []
         if codes:
-            # self.info_pipeline.download(codes)
+            self.info_pipeline.download(codes)
             self.fundamental_pipeline.download(codes)
         return None
 
