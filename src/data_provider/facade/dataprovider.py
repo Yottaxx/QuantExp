@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import pandas as pd
 import numpy as np
 import akshare as ak
@@ -17,7 +17,7 @@ from ..stores.secmaster_store import SecurityMasterStore
 from ..pipelines.price_pipeline import PricePipeline
 from ..pipelines.fundamental_pipeline import FundamentalPipeline
 from ..pipelines.info_pipeline import InfoPipeline
-from ..pipelines.panel_pipeline import PanelPipeline, _fingerprint
+from ..pipelines.panel_pipeline import PanelPipeline
 from ..pipelines.dataset_pipeline import DatasetPipeline
 from ..rules.split_policy import SplitPolicy
 from ..rules.trading_rules import TradingParams, add_trade_masks
@@ -162,7 +162,7 @@ def get_dataset(force_refresh: bool = False, adjust: str = "qfq"):
     from ...config import Config  # type: ignore
     from ...alpha_lib import AlphaFactory  # type: ignore
     try:
-        from ...vpn_rotator import vpn_rotator  # type: ignore
+        from src.data_provider.utils.vpn_rotator import vpn_rotator  # type: ignore
     except Exception:
         vpn_rotator = None
 

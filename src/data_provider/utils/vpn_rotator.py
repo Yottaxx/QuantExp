@@ -3,7 +3,7 @@ import requests
 import random
 import logging
 from urllib.parse import quote
-from .config import Config
+from src.config import Config
 
 # 配置日志
 logger = logging.getLogger(__name__)
