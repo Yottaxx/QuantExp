@@ -259,7 +259,7 @@ class PricePipeline:
         manifest_map = ManifestStore.to_map(mstore.load())
 
         todo = [(c, a) for c in codes for a in adjusts]
-        workers = int(self.cfg.get("PRICE_WORKERS", min(8, (os.cpu_count() or 8) + 8)) or 16)
+        workers = int(self.cfg.get("PRICE_WORKERS", min(16, (os.cpu_count() or 8) + 16)) or 16)
         max_inflight = int(self.cfg.get("PRICE_MAX_INFLIGHT", workers * 4) or (workers * 4))
         log_every = int(self.cfg.get("PRICE_PROGRESS_LOG_EVERY", 200) or 200)
 

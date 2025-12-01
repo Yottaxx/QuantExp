@@ -27,7 +27,7 @@ class Config:
     # =============================================================================
     # Data Range / Split
     # =============================================================================
-    START_DATE = "20250101"
+    START_DATE = "20010101"
 
     # v22 Dataset split uses TRAIN_RATIO / VAL_RATIO (test is remainder)
     TRAIN_RATIO = 0.8
@@ -42,13 +42,13 @@ class Config:
     CLASH_SECRET = "b342ba26-2ae3-47bb-a057-6624e171d5c6"
 
     USE_VPN_ROTATOR = True
-    VPN_ROTATE_COOLDOWN_SEC = 5
-    VPN_POST_ROTATE_SLEEP_SEC = 2.5
+    VPN_ROTATE_COOLDOWN_SEC = 2
+    VPN_POST_ROTATE_SLEEP_SEC = 1.2
 
     # AkShare retry
-    AK_RETRIES = 6
-    AK_RETRY_BASE_SLEEP = 0.8
-    AK_RETRY_MAX_SLEEP = 12
+    AK_RETRIES = 20
+    AK_RETRY_BASE_SLEEP = 0.2
+    AK_RETRY_MAX_SLEEP = 1
 
     # =============================================================================
     # Market / Calendar
@@ -125,7 +125,7 @@ class Config:
     INFO_WORKERS = 16         # 默认与行情并发一致（如需更小可调）
 
     # =============================================================================
-    # Fundamentals (optional)
+    # Fundamentals (opftional)
     # =============================================================================
     # v25: 只有 SYNC_FUNDAMENTAL=True 才会在 download_data() 中同步财务指标文件
     SYNC_FUNDAMENTAL = True

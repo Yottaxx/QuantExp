@@ -145,13 +145,13 @@ class AkClient:
         self.logger = logger
 
         # 1) 并发闸门
-        max_parallel = int(self.cfg.get("AK_MAX_PARALLEL", 3) or 3)
+        max_parallel = int(self.cfg.get("AK_MAX_PARALLEL", 6) or 6)
         self._sem = threading.Semaphore(max(1, max_parallel))
 
         # 2) 全局 QPS（自适应）
-        init_qps = float(self.cfg.get("AK_QPS", 2.0) or 2.0)
-        min_qps = float(self.cfg.get("AK_QPS_MIN", 0.6) or 0.6)
-        max_qps = float(self.cfg.get("AK_QPS_MAX", 3.0) or 3.0)
+        init_qps = float(self.cfg.get("AK_QPS", 12.0) or 12)
+        min_qps = float(self.cfg.get("AK_QPS_MIN", 1) or 1)
+        max_qps = float(self.cfg.get("AK_QPS_MAX", 24.0) or 3.0)
         self._rl = AdaptiveRateLimiter(init_qps=init_qps, min_qps=min_qps, max_qps=max_qps)
 
         # 3) 全局冷却窗口（跨线程）

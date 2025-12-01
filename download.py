@@ -63,6 +63,7 @@ def main() -> int:
 
     p = argparse.ArgumentParser(description="Download & cache data via DataProvider.")
     p.add_argument("--adjusts", type=str, default="qfq", help="Comma-separated adjusts, e.g. qfq,hfq,raw. Empty => DataProvider default.")
+    p.add_argument("--download_data", action="store_true", help="Data downloading")
     p.add_argument("--build-panel", action="store_true", help="Also build parts and materialize panel_df after download.")
     p.add_argument("--save-dataset", action="store_true", help="Also build HF Dataset and save_to_disk (requires --build-panel).")
 
@@ -125,9 +126,10 @@ def main() -> int:
     }
 
     try:
-        log.info(f"=== [download.py] Downloading data (adjusts={adjusts}) ===")
-        dp.download_data(adjusts=adjusts)
-        log.info("✅ download_data finished (cached by pipelines).")
+        if args.download_data:
+            log.info(f"=== [download.py] Downloading data (adjusts={adjusts}) ===")
+            dp.download_data(adjusts=adjusts)
+            log.info("✅ download_data finished (cached by pipelines).")
 
         if args.build_panel:
             # For panel build, pick the first adjust as the main one (most common usage).
