@@ -16,7 +16,7 @@ class Config:
     # --- 数据参数 ---
     START_DATE = "20010101"
     END_DATE = "20251128"
-    TARGET_DATE = "20251017"
+    TARGET_DATE = "20251125"
     # [CRITICAL UPDATE] 数据集划分比例 (Train / Valid / Test)
     # Valid 用于 Training 过程中的 Early Stopping
     # Test 用于 Analysis 和 Backtest (完全隔离)
@@ -33,7 +33,7 @@ class Config:
     MARKET_INDEX_SYMBOL = "sh000001"
 
     FEATURE_PREFIXES = [
-        'style_', 'tech_', 'alpha_', 'adv_', 'ind_', 'fund_',
+        'basic','liq','style_', 'tech_', 'alpha_', 'adv_', 'ind_', 'fund_',
         'cs_rank_', 'mkt_', 'rel_', 'time_'
     ]
 

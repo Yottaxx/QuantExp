@@ -49,37 +49,33 @@ def run_inference(target_date=None, top_k=Config.TOP_K, min_score_threshold=Conf
     model.eval()
 
     # 处理 target_date 格式
-    if target_date:
-        target_dt = pd.to_datetime(target_date)
-    else:
-        target_dt = None
 
-    print(f"加载数据 (End Date: {target_dt.date() if target_dt else 'Auto'})...")
+    print(f"加载数据 (End Date: {target_date})...")
 
     try:
         # [CRITICAL] 传递 target_date 给 DataProvider 进行数据截断，防止未来数据泄露
-        panel_df, feature_cols = DataProvider.load_and_process_panel(mode='predict', end_date=target_dt)
+        panel_df, feature_cols = DataProvider.load_and_process_panel(mode='predict', end_date=target_date)
     except Exception as e:
         print(f"❌ 数据加载失败: {e}")
         return []
 
     # 确定最终的推理日期
-    if target_dt is None:
+    if target_date is None:
         last_date = panel_df['date'].max()
     else:
-        last_date = target_dt
+        last_date = target_date
 
-    print(f"📅 推理基准日期: {last_date.date()}")
+    print(f"📅 推理基准日期: {last_date}")
 
     # 检查该日期是否有数据
     if last_date not in panel_df['date'].values:
-        print(f"❌ 错误：指定日期 {last_date.date()} 在数据集中不存在（可能是非交易日）。")
+        print(f"❌ 错误：指定日期 {last_date} 在数据集中不存在（可能是非交易日）。")
         # 可选：寻找最近的前一个交易日
         available_dates = panel_df['date'].unique()
         prev_dates = available_dates[available_dates < last_date]
         if len(prev_dates) > 0:
             last_date = prev_dates.max()
-            print(f"🔄 自动回退至最近交易日: {last_date.date()}")
+            print(f"🔄 自动回退至最近交易日: {last_date}")
         else:
             return []
 
