@@ -62,7 +62,7 @@ class AkErrorClassifier:
 
     # ✅ net 中“更像被掐/被限”的子集：允许 rotate
     _net_rotate = re.compile(
-        r"(ConnectionResetError|ECONNRESET|reset by peer|errno\s*54|remote end closed|RemoteDisconnected)",
+        r"(ConnectionResetError|ECONNRESET|reset by peer|exceeded|errno\s*54|remote end closed|RemoteDisconnected)",
         re.IGNORECASE,
     )
 
