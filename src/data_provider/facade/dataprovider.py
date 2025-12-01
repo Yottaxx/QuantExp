@@ -62,6 +62,7 @@ class DataProvider:
     def _norm_adjust(adjust: Optional[str]) -> str:
         return norm_adjust(adjust)
 
+    @staticmethod
     def _price_dir(self, adj_norm: str) -> str:
         return price_dir(self.cfg, norm_adjust(adj_norm))
 
@@ -168,4 +169,4 @@ def get_dataset(force_refresh: bool = False, adjust: str = "qfq"):
 
     dp = DataProvider(Config=Config, AlphaFactory=AlphaFactory, vpn_rotator=vpn_rotator)
     panel_df, feature_cols = dp.load_and_process_panel(mode="train", force_refresh=force_refresh, adjust=adjust)
-    return dp.make_dataset(panel_df, feature_cols)
+    return dp.make_dataset(panel_df, feature_cols),feature_cols

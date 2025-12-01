@@ -11,7 +11,9 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
+from ..alpha_lib import AlphaFactory
 from ..config import Config
+from ..data_provider.utils.vpn_rotator import vpn_rotator
 from ..model import PatchTSTForStock
 from ..data_provider import DataProvider
 
@@ -43,7 +45,8 @@ class SignalEngine:
 
     @staticmethod
     def load_panel(adjust: str, mode: str) -> Tuple[pd.DataFrame, List[str]]:
-        panel_df, feature_cols = DataProvider.load_and_process_panel(mode=mode, adjust=adjust)
+        dp = DataProvider(Config=Config, AlphaFactory=AlphaFactory, vpn_rotator=vpn_rotator)
+        panel_df, feature_cols = dp.load_and_process_panel(mode=mode, adjust=adjust)
         panel_df = panel_df.copy()
         panel_df["date"] = pd.to_datetime(panel_df["date"], errors="coerce")
         panel_df["code"] = panel_df["code"].astype(str)
