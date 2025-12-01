@@ -154,7 +154,7 @@ class DataProvider:
                 "feature_cols": feature_cols,
             }
             self.dataset_pipeline.save_to_disk_atomic(ds, out_dir, meta=meta)
-            print(f"------save hf dataset tot {out_dir}------")
+            self.logger.info(f"------save hf dataset tot {out_dir}------")
         return ds
 
 def get_dataset(force_refresh: bool = False, adjust: str = "qfq"):

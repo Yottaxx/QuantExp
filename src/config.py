@@ -21,6 +21,7 @@ class Config:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     LOG_LEVEL = "INFO"
+    EXPERIMENT_NAME = "default"
     PARQUET_COMPRESSION = "zstd"
 
     # =============================================================================

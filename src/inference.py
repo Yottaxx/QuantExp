@@ -5,9 +5,13 @@ from __future__ import annotations
 
 import pandas as pd
 import numpy as np
+from utils.logging_utils import get_logger
 
 from .config import Config
 from .core.signal_engine import SignalEngine
+
+
+logger = get_logger()
 
 
 def _run_latest_via_engine(
@@ -58,9 +62,9 @@ def _run_latest_via_engine(
 
 
 def run_inference(top_k=Config.TOP_K, min_score_threshold=Config.MIN_SCORE_THRESHOLD, adjust="qfq"):
-    print("\n" + "=" * 50)
-    print(f">>> 启动全市场每日选股 [Adjust={adjust}]")
-    print("=" * 50)
+    logger.info("=" * 50)
+    logger.info(f">>> 启动全市场每日选股 [Adjust={adjust}]")
+    logger.info("=" * 50)
 
     try:
         final_picks, meta = _run_latest_via_engine(
@@ -71,7 +75,7 @@ def run_inference(top_k=Config.TOP_K, min_score_threshold=Config.MIN_SCORE_THRES
             batch_size=int(getattr(Config, "INFERENCE_BATCH_SIZE", 2048)),
         )
     except Exception as e:
-        print(f"❌ 推理失败: {e}")
+        logger.error(f"❌ 推理失败: {e}")
         return []
 
     last_date = meta.get("last_date")
@@ -80,15 +84,15 @@ def run_inference(top_k=Config.TOP_K, min_score_threshold=Config.MIN_SCORE_THRES
     top_score = float(meta.get("top_score", -1.0))
     raw_topk = meta.get("raw_topk", [])
 
-    print(f"📅 最新交易日: {pd.to_datetime(last_date).date()}")
-    print(f"📊 市场状态: {regime} | mom={mom:.4f} | top_score={top_score:.4f}")
+    logger.info(f"📅 最新交易日: {pd.to_datetime(last_date).date()}")
+    logger.info(f"📊 市场状态: {regime} | mom={mom:.4f} | top_score={top_score:.4f}")
 
     if regime == "Bear":
-        print("⚠️ 熊市特征明显：建议空仓或极低仓位。")
+        logger.warning("⚠️ 熊市特征明显：建议空仓或极低仓位。")
 
-    print("-" * 60)
-    print(f"{'排名':<5} | {'代码':<10} | {'AI预测分':<10} | {'PE(TTM)':<10} | {'建议'}")
-    print("-" * 60)
+    logger.info("-" * 60)
+    logger.info(f"{'排名':<5} | {'代码':<10} | {'AI预测分':<10} | {'PE(TTM)':<10} | {'建议'}")
+    logger.info("-" * 60)
 
     # 打印 raw_topk，再按 advice 过滤后返回 final_picks（与你原来的交互一致）
     picks_out: list[tuple[str, float, float | None]] = []
@@ -121,16 +125,16 @@ def run_inference(top_k=Config.TOP_K, min_score_threshold=Config.MIN_SCORE_THRES
             else:
                 advice = "过滤"
 
-        print(f"{rank:<5} | {code:<10} | {score:.6f}     | {pe_str:<10} | {advice}")
+        logger.info(f"{rank:<5} | {code:<10} | {score:.6f}     | {pe_str:<10} | {advice}")
 
         if code in final_set:
             picks_out.append((code, score, pe))
 
-    print("=" * 60)
+    logger.info("=" * 60)
     if len(picks_out) < min(int(top_k), len(raw_topk)):
-        print(f"💡 风控生效：{min(int(top_k), len(raw_topk))} -> {len(picks_out)}")
+        logger.info(f"💡 风控生效：{min(int(top_k), len(raw_topk))} -> {len(picks_out)}")
     if not picks_out:
-        print("🛡️ 最终决策：空仓")
+        logger.info("🛡️ 最终决策：空仓")
 
     return picks_out
 
