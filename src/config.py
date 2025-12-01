@@ -130,7 +130,7 @@ class Config:
     SYNC_FUNDAMENTAL = True
     USE_FUNDAMENTAL = True    # True: panel 侧做 PIT 合并（merge_asof）
     FUND_TTL_DAYS = 5         # 财务更新频率低，缓存天数
-    FUNDAMENTAL_START_YEAR = "2010"  # AkShare 财务指标起始年（字符串）
+    FUNDAMENTAL_START_YEAR = "1990"  # AkShare 财务指标起始年（字符串）
     FUND_LAG_DAYS = 90                 # 兜底：无公告日时假设 date+lag 才可用
     FUND_FALLBACK_LAG_DAYS = FUND_LAG_DAYS  # v25 统一字段名（兼容旧字段）
 

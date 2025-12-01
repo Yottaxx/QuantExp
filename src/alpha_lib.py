@@ -28,7 +28,7 @@ class AlphaFactory:
     - No aggressive local ffill by default (avoid smoothing suspensions)
     """
 
-    VERSION = "v18.0-panel"
+    VERSION = "v18.1-panel-fund"  # Updated version
     EPS = 1e-9
 
     def __init__(self, df: pd.DataFrame):
@@ -66,6 +66,7 @@ class AlphaFactory:
                 "pe_ttm", "pb", "roe", "profit_growth", "rev_growth", "debt_ratio",
                 "tradable_mask", "buyable_mask", "sellable_mask",
                 "limit_rate",
+                "eps", "bps",  # Added: support basic per-share metrics
             ]
         )
 
@@ -210,6 +211,17 @@ class AlphaFactory:
     # 4) Fundamentals (keep NaN; CS layer handles fill)
     # =============================================================================
     def _build_fundamental_factors(self):
+        # ---- 1. Derive Valuation from EPS/BPS if missing ----
+        # If upstream didn't provide pre-calculated PE/PB, we compute using current price.
+        # NOTE: If 'eps' is raw quarterly EPS, this PE will be Quarterly PE, not TTM.
+        # Ensure your input 'eps' is aligned with your expectations (e.g. TTM).
+        if "eps" in self.df.columns and "pe_ttm" not in self.df.columns:
+            self.df["pe_ttm"] = (self.close / (self.df["eps"].replace(0, np.nan))).astype(np.float32)
+
+        if "bps" in self.df.columns and "pb" not in self.df.columns:
+            self.df["pb"] = (self.close / (self.df["bps"].replace(0, np.nan))).astype(np.float32)
+
+        # ---- 2. Build EP/BP Factors (Inverse Valuation) ----
         if "pe_ttm" in self.df.columns:
             pe = self.df["pe_ttm"].replace(0, np.nan)
             self.df["fund_ep"] = (1.0 / (pe + self.EPS)).astype(np.float32)
@@ -217,6 +229,7 @@ class AlphaFactory:
             pb = self.df["pb"].replace(0, np.nan)
             self.df["fund_bp"] = (1.0 / (pb + self.EPS)).astype(np.float32)
 
+        # ---- 3. Pass-through other fundamental ratios ----
         for col in ["roe", "profit_growth", "rev_growth", "debt_ratio"]:
             if col in self.df.columns:
                 self.df[f"fund_{col}"] = self.df[col].astype(np.float32)
