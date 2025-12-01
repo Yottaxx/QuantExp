@@ -26,8 +26,9 @@ class SotaConfig(PatchTSTConfig):
 
 class QuantLoss(nn.Module):
     """
-    【SOTA Quant Loss v2.0】
-    融合了 IC (Information Coefficient) 优化与 Pairwise Ranking (RankNet) 思想。
+    【SOTA Quant Loss v2.1 - Ranking Enhanced】
+    集成 MSE + IC(Cosine) + Pairwise RankNet
+    目标：直接优化横截面排序能力 (IC/RankIC)，而非点预测精度。
     """
 
     def __init__(self, mse_weight=1.0, rank_weight=1.0):
@@ -38,73 +39,68 @@ class QuantLoss(nn.Module):
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
-        :param pred:  [Batch, 1] 模型预测的分数 (Logits)
-        :param target: [Batch, 1] 真实的收益率或 Rank Label
+        :param pred:  [Batch, 1] Logits
+        :param target: [Batch, 1] Returns / Labels
         """
         pred = pred.flatten()
         target = target.flatten()
 
-        # 1. 基础 MSE 损失 (Anchor)
-        # 用于约束预测值的分布范围，防止梯度爆炸
+        # 1. MSE Loss (Anchor)
+        # 作用：防止预测值漂移到无穷大，保持数值分布合理
         mse = self.mse_loss(pred, target)
 
-        # 2. IC 损失 (Pearson Correlation Proxy)
-        # 使用 Cosine Similarity 替代手动计算，利用 PyTorch 底层优化，数值更稳定
-        # Cosine(x-mean, y-mean) == Pearson(x, y)
+        # 2. IC Loss (Correlation Proxy)
+        # 作用：优化整体线性相关性
+        ic_loss = torch.tensor(0.0, device=pred.device)
         if pred.numel() > 1:
             pred_centered = pred - pred.mean()
             target_centered = target - target.mean()
-
-            # 添加 epsilon 防止除零错误
+            # 使用 Cosine Similarity 替代 Pearson，数值更稳定
             cosine_sim = F.cosine_similarity(
                 pred_centered.unsqueeze(0),
                 target_centered.unsqueeze(0),
                 dim=1,
                 eps=1e-8
             )
-            # 我们希望相关性越大越好，所以 Loss = 1 - IC
             ic_loss = 1 - cosine_sim.mean()
-        else:
-            ic_loss = torch.tensor(0.0, device=pred.device)
 
-        # 3. (可选) Pairwise Ranking Loss 思想
-        # 如果这是一个强排序任务，可以引入 Pairwise Margin Loss
-        # 这里为了保持训练速度，暂时只用 IC Loss 代表排序能力
-        # rank_loss = torch.tensor(0.0, device=pred.device)
-        #
-        # if self.rank_weight > 0 and pred.numel() > 1:
-        #     # A. 构建 Pairwise 差值矩阵 [Batch, Batch]
-        #     # pred_diff[i][j] = pred[i] - pred[j]
-        #     pred_diff = pred.unsqueeze(1) - pred.unsqueeze(0)
-        #
-        #     # target_diff[i][j] = target[i] - target[j]
-        #     target_diff = target.unsqueeze(1) - target.unsqueeze(0)
-        #
-        #     # B. 生成“正序对”掩码 (Mask)
-        #     # 我们只关心那些 target_i > target_j 的配对 (即 target_diff > 0)
-        #     # 这样避免重复计算 (i,j) 和 (j,i)，也忽略了 target_i == target_j 的噪声对
-        #     s_ij = (target_diff > 0).float()
-        #
-        #     # C. 计算 RankNet 损失
-        #     # RankNet Loss L = log(1 + exp(-(s_i - s_j))) 当真实标签为 i > j 时
-        #     # 使用 logaddexp 函数保证数值稳定性，避免 exp 溢出
-        #     # log(1 + e^x) 等价于 softplus(x) 或 logaddexp(0, x)
-        #     pairwise_loss = torch.logaddexp(torch.zeros_like(pred_diff), -pred_diff)
-        #
-        #     # D. 只计算有效配对的 Loss
-        #     # 有效配对数
-        #     num_valid_pairs = s_ij.sum()
-        #
-        #     if num_valid_pairs > 0:
-        #         # 引入权重：可以根据 target 差异的大小加权 (差异越大，排序越重要)
-        #         # 这里暂时使用简单的平均，你也可以改为: weighted_loss = pairwise_loss * s_ij * target_diff.abs()
-        #         rank_loss = (pairwise_loss * s_ij).sum() / num_valid_pairs
-        # total_loss = (self.mse_weight * mse) + (self.rank_weight * ic_loss) + (self.rank_weight * rank_loss)
+        # 3. Pairwise Ranking Loss (RankNet / ListMLE)
+        # 作用：核心 Alpha 能力，强制模型学习 "A > B" 的关系
+        rank_loss = torch.tensor(0.0, device=pred.device)
 
-        # 最终 Loss 组合
-        total_loss = (self.mse_weight * mse) + (self.rank_weight * ic_loss)
+        # 仅当 Batch 内有多个样本且 rank_weight > 0 时计算
+        if self.rank_weight > 0 and pred.numel() > 1:
+            # A. 构建差值矩阵 [Batch, Batch]
+            # pred_diff[i][j] = pred[i] - pred[j]
+            pred_diff = pred.unsqueeze(1) - pred.unsqueeze(0)
+            target_diff = target.unsqueeze(1) - target.unsqueeze(0)
+
+            # B. 指示矩阵 S_ij
+            # S_ij = 1 (如果 target_i > target_j), -1 (如果 target_i < target_j), 0 (平局)
+            S_ij = torch.sign(target_diff)
+
+            # C. RankNet Loss 计算
+            # Loss = log(1 + exp(-sigma * (si - sj)))
+            # 简化形式: softplus(-S_ij * pred_diff)
+            # 这种写法利用了 log-sum-exp trick 保证数值稳定性
+            pairwise_losses = F.softplus(-S_ij * pred_diff)
+
+            # D. Masking
+            # 1. 过滤掉平局 (target_diff == 0) 的样本对，它们不提供排序梯度
+            # 2. 过滤掉自比较 (i==j)
+            mask = (target_diff.abs() > 1e-6).float()
+
+            # E. 聚合
+            valid_pairs = mask.sum()
+            if valid_pairs > 0:
+                rank_loss = (pairwise_losses * mask).sum() / valid_pairs
+
+        # 4. 最终加权
+        total_loss = (self.mse_weight * mse) + \
+                     (self.rank_weight * ic_loss) + \
+                     (self.rank_weight * rank_loss)
+
         return total_loss
-
 
 class PatchTSTForStock(PatchTSTPreTrainedModel):
     config_class = SotaConfig

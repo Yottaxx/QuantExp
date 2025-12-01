@@ -6,7 +6,7 @@ from .config import Config
 from .model import PatchTSTForStock, SotaConfig
 from .data_provider import get_dataset
 import os
-
+from transformers import default_data_collator
 def compute_metrics(eval_pred):
     """
     计算 Validation 集指标 (用于 Early Stopping)
@@ -38,6 +38,7 @@ def run_training():
     print(f"Evaluating on: {len(ds['validation'])} samples (Early Stopping)")
     print(f"Held-out Test: {len(ds['test'])} samples (Ignored during training)")
 
+
     model_config = SotaConfig(
         num_input_channels=num_features,
         context_length=Config.CONTEXT_LEN,
@@ -47,7 +48,8 @@ def run_training():
         num_hidden_layers=3,
         n_heads=4,
         dropout=Config.DROPOUT,
-        mse_weight=Config.MSE_WEIGHT
+        mse_weight=Config.MSE_WEIGHT,
+        rank_weight=getattr(Config, "RANK_WEIGHT", 1.0)  # 向后兼容
     )
 
     model = PatchTSTForStock(model_config)

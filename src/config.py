@@ -6,7 +6,7 @@ import torch
 class Config:
     """
     【全局配置中心 - Production Grade】
-    - 已融合 data_provider.py v22 所需配置项
+    - 已融合 old_data_provider.py v22 所需配置项
     - 对外接口不改；新增项均提供默认值
     """
 
@@ -116,15 +116,27 @@ class Config:
     ALLOW_LEGACY_PRICE_CACHE = False
 
     # =============================================================================
+    # Static Info (optional)
+    # =============================================================================
+    # v25: 只有 SYNC_INFO=True 才会在 download_data() 同步静态信息（个股资料：行业/简称/上市时间/总市值等）
+    SYNC_INFO = True
+    INFO_TTL_DAYS = 30        # 静态信息缓存天数
+    INFO_WORKERS = 16         # 默认与行情并发一致（如需更小可调）
+
+    # =============================================================================
     # Fundamentals (optional)
     # =============================================================================
-    # v22: 只有 SYNC_FUNDAMENTAL=True 才会在 download_data() 中同步财务指标文件
-    SYNC_FUNDAMENTAL = False  # 如你希望 download_data() 同步基本面，改 True
-    USE_FUNDAMENTAL = False   # 如你希望面板合并 PIT 基本面，改 True
-    FUND_LAG_DAYS = 90        # 你系统可用（v22 未强依赖）
+    # v25: 只有 SYNC_FUNDAMENTAL=True 才会在 download_data() 中同步财务指标文件
+    SYNC_FUNDAMENTAL = True
+    USE_FUNDAMENTAL = True    # True: panel 侧做 PIT 合并（merge_asof）
+    FUND_TTL_DAYS = 5         # 财务更新频率低，缓存天数
+    FUNDAMENTAL_START_YEAR = "2010"  # AkShare 财务指标起始年（字符串）
+    FUND_LAG_DAYS = 90                 # 兜底：无公告日时假设 date+lag 才可用
+    FUND_FALLBACK_LAG_DAYS = FUND_LAG_DAYS  # v25 统一字段名（兼容旧字段）
 
     # =============================================================================
     # Universe (optional filters)
+    # =============================================================================
     # =============================================================================
     UNIVERSE_TTL_SEC = 24 * 3600
     FORCE_UNIVERSE_REFRESH = False
@@ -174,7 +186,8 @@ class Config:
     BATCH_SIZE = 128
     EPOCHS = 20
     LR = 1e-4
-    MSE_WEIGHT = 0.5
+    MSE_WEIGHT = 0.1
+    RANK_WEIGHT = 1.0
     MAX_GRAD_NORM = 1.0
 
     # =============================================================================
