@@ -30,6 +30,8 @@ import traceback
 from datetime import datetime
 from typing import List, Optional
 
+from utils.logging_utils import get_logger, init_logger
+
 
 def _ensure_sys_path() -> None:
     """Ensure project root is in sys.path so `import src.*` works when run as a script."""
@@ -69,22 +71,35 @@ def main() -> int:
     p.add_argument("--backend", type=str, default=None, help="Optional backend selector for panel pipeline.")
     p.add_argument("--debug", action="store_true", help="Enable debug mode for panel pipeline.")
 
+    p.add_argument(
+        "--exp-name",
+        type=str,
+        default=None,
+        help="实验名称，会拼接到本次运行时间生成的 logger 名称中",
+    )
+
     p.add_argument("--run-manifest", type=str, default="runs", help="Where to write a small run manifest json (default: ./runs).")
 
     args = p.parse_args()
+    log = init_logger(args.exp_name, level="INFO")
     adjusts = _parse_adjusts(args.adjusts)
 
     if args.save_dataset and not args.build_panel:
-        print("❌ --save-dataset requires --build-panel")
+        log.error("❌ --save-dataset requires --build-panel")
         return 2
 
     # ---- Imports from your project ----
     try:
         from src.config import Config  # type: ignore
         from src.alpha_lib import AlphaFactory  # type: ignore
+
+        log = init_logger(
+            args.exp_name or getattr(Config, "EXPERIMENT_NAME", "default"),
+            level=str(getattr(Config, "LOG_LEVEL", "INFO") or "INFO"),
+        )
     except Exception as e:
-        print("❌ Failed to import src.config / src.alpha_lib. Are you running from project root?")
-        print(f"   Error: {e}")
+        log.error("❌ Failed to import src.config / src.alpha_lib. Are you running from project root?")
+        log.error(f"   Error: {e}")
         return 2
 
     try:
@@ -92,8 +107,8 @@ def main() -> int:
         vpn_rotator = _load_vpn_rotator()
         dp = DataProvider(Config=Config, AlphaFactory=AlphaFactory, vpn_rotator=vpn_rotator)
     except Exception as e:
-        print("❌ Failed to construct DataProvider")
-        print(f"   Error: {e}")
+        log.error("❌ Failed to construct DataProvider")
+        log.error(f"   Error: {e}")
         traceback.print_exc()
         return 2
 
@@ -110,14 +125,14 @@ def main() -> int:
     }
 
     try:
-        print(f"\n=== [download.py] Downloading data (adjusts={adjusts}) ===")
+        log.info(f"=== [download.py] Downloading data (adjusts={adjusts}) ===")
         dp.download_data(adjusts=adjusts)
-        print("✅ download_data finished (cached by pipelines).")
+        log.info("✅ download_data finished (cached by pipelines).")
 
         if args.build_panel:
             # For panel build, pick the first adjust as the main one (most common usage).
             adj_main = (adjusts[0] if adjusts else "qfq")
-            print(f"\n=== [download.py] Building panel (adjust={adj_main}, mode={args.mode}) ===")
+            log.info(f"=== [download.py] Building panel (adjust={adj_main}, mode={args.mode}) ===")
             panel_df, feature_cols = dp.load_and_process_panel(
                 mode=args.mode,
                 force_refresh=bool(args.force_refresh),
@@ -135,12 +150,12 @@ def main() -> int:
                     }
                 }
             )
-            print("✅ panel_df materialized.")
+            log.info("✅ panel_df materialized.")
             if isinstance(panel_df.attrs.get("parts_dir"), str) and panel_df.attrs.get("parts_dir"):
-                print(f"   parts_dir: {panel_df.attrs.get('parts_dir')}")
+                log.info(f"   parts_dir: {panel_df.attrs.get('parts_dir')}")
 
             if args.save_dataset:
-                print("\n=== [download.py] Building dataset (and saving to disk if enabled in cfg) ===")
+                log.info("=== [download.py] Building dataset (and saving to disk if enabled in cfg) ===")
                 ds = dp.make_dataset(panel_df, feature_cols)
                 # dp.make_dataset already saves to parts_dir/hf_dataset when configured.
                 manifest["dataset"] = {"type": str(type(ds))}
@@ -149,7 +164,7 @@ def main() -> int:
                 if parts_dir:
                     hf_dir = os.path.join(parts_dir, "hf_dataset")
                     manifest["dataset"]["saved_to"] = hf_dir
-                    print(f"✅ dataset built. (expected save_to_disk: {hf_dir})")
+                    log.info(f"✅ dataset built. (expected save_to_disk: {hf_dir})")
 
         # write manifest
         out_dir = str(args.run_manifest or "").strip()
@@ -158,17 +173,17 @@ def main() -> int:
             out_path = os.path.join(out_dir, f"download_run_{run_ts}.json")
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(manifest, f, ensure_ascii=False, indent=2)
-            print(f"\n🧾 run manifest: {out_path}")
+            log.info(f"🧾 run manifest: {out_path}")
 
-        print("\n🎉 Done.")
+        log.info("🎉 Done.")
         return 0
 
     except KeyboardInterrupt:
-        print("\n🟡 Interrupted by user.")
+        log.warning("🟡 Interrupted by user.")
         return 130
     except Exception as e:
-        print("\n❌ Failed.")
-        print(f"   Error: {e}")
+        log.error("❌ Failed.")
+        log.error(f"   Error: {e}")
         traceback.print_exc()
         return 1
 

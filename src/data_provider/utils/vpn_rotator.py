@@ -3,14 +3,14 @@ from __future__ import annotations
 
 import random
 import time
-import logging
 from urllib.parse import quote
 from typing import Dict, Optional, List
 
 import requests
 from src.config import Config
+from utils.logging_utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 class ClashRotator:

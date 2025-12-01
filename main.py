@@ -7,6 +7,8 @@ import os
 import sys
 from typing import Any, Dict, Optional
 
+from utils.logging_utils import get_logger, init_logger
+
 from utils.utils_func import (
     apply_config_overrides,
     debug_print_config,
@@ -98,6 +100,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="随机种子覆盖（默认使用 Config.SEED 或 42）",
+    )
+    p.add_argument(
+        "--exp-name",
+        type=str,
+        default=None,
+        help="实验名称，会拼接到本次运行时间生成的 logger 名称中",
     )
 
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -204,6 +212,13 @@ def apply_runtime_config(args: argparse.Namespace) -> Any:
     overrides: Dict[str, Any] = parse_kv_pairs(args.set)
     apply_config_overrides(Config, overrides, strict=args.strict_config)
 
+    # 2.1) 日志
+    level = str(getattr(Config, "LOG_LEVEL", "INFO") or "INFO")
+    exp_name = args.exp_name or getattr(Config, "EXPERIMENT_NAME", "default")
+    global _RUN_LOGGER
+    _RUN_LOGGER = init_logger(exp_name, level=level)
+    log = _RUN_LOGGER
+
     # 3) debug profile
     if args.debug:
         setup_debug_mode(Config)
@@ -217,37 +232,40 @@ def apply_runtime_config(args: argparse.Namespace) -> Any:
 
     # 6) 打印 Config 概览
     if args.print_config or args.cmd == "config" or args.debug:
-        debug_print_config(Config)
+        debug_print_config(Config, logger=log)
         # DataProvider 可能没有 debug_print_config，新版仅打印 VERSION 即可
         try:
             dp_mod = _import_src("data_provider")
             DP = getattr(dp_mod, "DataProvider", None)
             if DP is not None and hasattr(DP, "VERSION"):
-                print(f"\n[DataProvider] VERSION = {getattr(DP, 'VERSION')}\n")
+                log.info(f"[DataProvider] VERSION = {getattr(DP, 'VERSION')}")
         except Exception as e:  # noqa: BLE001
-            print(f"[warn] DataProvider introspection failed: {e}")
+            log.warning(f"[warn] DataProvider introspection failed: {e}")
 
     return Config
 
 
 def cmd_download() -> None:
+    log = _get_run_logger()
     dp_mod = _import_src("data_provider")
     dp_mod.DataProvider.download_data()
 
 
 def cmd_panel(mode: str, adjust: str, force_refresh: bool) -> None:
+    log = _get_run_logger()
     dp_mod = _import_src("data_provider")
     panel_df, feature_cols = dp_mod.DataProvider.load_and_process_panel(
         mode=mode,
         adjust=adjust,
         force_refresh=force_refresh,
     )
-    print(
+    log.info(
         f"✅ Panel ready: shape={panel_df.shape}, features={len(feature_cols)} (mode={mode}, adjust={adjust})"
     )
 
 
 def cmd_train() -> None:
+    log = _get_run_logger()
     tr_mod = _import_src("train")
     tr_mod.run_training()
 
@@ -257,6 +275,7 @@ def cmd_predict(
     min_score: Optional[float],
     save_csv: Optional[str] = None,
 ):
+    log = _get_run_logger()
     cfg_mod = _import_src("config")
     Config = cfg_mod.Config
 
@@ -272,7 +291,7 @@ def cmd_predict(
         df = pd.DataFrame(picks, columns=["code", "score", "pe"])
         os.makedirs(os.path.dirname(save_csv) or ".", exist_ok=True)
         df.to_csv(save_csv, index=False, encoding="utf-8-sig")
-        print(f"💾 Picks saved to {save_csv}")
+        log.info(f"💾 Picks saved to {save_csv}")
 
     return picks
 
@@ -284,6 +303,7 @@ def cmd_backtest(
     top_k: Optional[int],
     min_score: Optional[float],
 ) -> None:
+    log = _get_run_logger()
     cfg_mod = _import_src("config")
     Config = cfg_mod.Config
     bt_mod = _import_src("backtest")
@@ -294,7 +314,7 @@ def cmd_backtest(
         code_list = [c for (c, *_rest) in picks]
 
     if not code_list:
-        print("⚠️ No codes to backtest, exiting.")
+        log.warning("⚠️ No codes to backtest, exiting.")
         return
 
     k = int(top_k if top_k is not None else Config.TOP_K)
@@ -316,6 +336,7 @@ def cmd_walkforward(start: str, end: str, initial_cash: float, top_k: Optional[i
 
 
 def cmd_analysis(target_set: str, start: Optional[str], end: Optional[str]) -> None:
+    log = _get_run_logger()
     an_mod = _import_src("analysis")
     analyzer = an_mod.BacktestAnalyzer(
         target_set=target_set,
@@ -336,7 +357,7 @@ def cmd_factor_eval(mode: str, adjust: str, force_refresh: bool) -> None:
         force_refresh=force_refresh,
     )
     valid = ev_mod.AlphaEvaluator.evaluate(panel_df, feat_cols, target_col="target")
-    print(f"✅ Valid factors: {len(valid)}/{len(feat_cols)}")
+    log.info(f"✅ Valid factors: {len(valid)}/{len(feat_cols)}")
 
 
 def cmd_debug(
@@ -351,19 +372,20 @@ def cmd_debug(
     cfg_mod = _import_src("config")
     Config = cfg_mod.Config
 
-    print("\n" + "=" * 80)
-    print("🧪 DEBUG PIPELINE: panel -> inference -> backtest")
-    print("=" * 80)
+    log = _get_run_logger()
+    log.info("=" * 80)
+    log.info("🧪 DEBUG PIPELINE: panel -> inference -> backtest")
+    log.info("=" * 80)
 
     # Step 1: 尝试构建一份 train panel（如果 DataProvider 支持 debug 参数，会由 main 统一打补丁）
     try:
         dp_mod = _import_src("data_provider")
         panel_df, feature_cols = dp_mod.DataProvider.load_and_process_panel(mode="train")
-        print(
+        log.info(
             f"[1/3] panel_df.shape={panel_df.shape}, features={len(feature_cols)}  ✅",
         )
     except Exception as e:  # noqa: BLE001
-        print(f"[1/3] ❌ DataProvider.load_and_process_panel failed: {e}")
+        log.error(f"[1/3] ❌ DataProvider.load_and_process_panel failed: {e}")
         return
 
     # Step 2: 运行一次 inference（通常是最近交易日）
@@ -372,13 +394,13 @@ def cmd_debug(
         thr = float(min_score if min_score is not None else Config.MIN_SCORE_THRESHOLD)
         inf_mod = _import_src("inference")
         picks = inf_mod.run_inference(top_k=k, min_score_threshold=thr)
-        print(f"[2/3] inference picks={len(picks)}  ✅")
+        log.info(f"[2/3] inference picks={len(picks)}  ✅")
     except Exception as e:  # noqa: BLE001
-        print(f"[2/3] ❌ run_inference failed: {e}")
+        log.error(f"[2/3] ❌ run_inference failed: {e}")
         return
 
     if not picks:
-        print("[2/3] ⚠️ No picks returned; skip backtest.")
+        log.warning("[2/3] ⚠️ No picks returned; skip backtest.")
         return
 
     # Step 3: 对这批标的做一轮快速回测（不含费用）
@@ -386,7 +408,7 @@ def cmd_debug(
         codes = [c for (c, *_rest) in picks]
         bt_mod = _import_src("backtest")
         k_bt = min(len(codes), int(getattr(Config, "TOP_K", len(codes))))
-        print(
+        log.info(
             f"[3/3] Running debug backtest on {k_bt} codes, initial_cash={initial_cash:.0f} ...",
         )
         bt_mod.run_single_backtest(
@@ -395,9 +417,9 @@ def cmd_debug(
             initial_cash=initial_cash,
             top_k=k_bt,
         )
-        print("[3/3] debug backtest finished  ✅")
+        log.info("[3/3] debug backtest finished  ✅")
     except Exception as e:  # noqa: BLE001
-        print(f"[3/3] ❌ debug backtest failed: {e}")
+        log.error(f"[3/3] ❌ debug backtest failed: {e}")
 
 
 def main(argv=None) -> None:
@@ -417,7 +439,7 @@ def main(argv=None) -> None:
             debug_flag=getattr(args, "debug", False),
         )
     except Exception as e:  # noqa: BLE001
-        print(f"[warn] patch_dataprovider_defaults failed: {e}")
+        _get_run_logger().warning(f"[warn] patch_dataprovider_defaults failed: {e}")
 
     # 根据子命令分发逻辑
     if args.cmd == "config":
@@ -460,3 +482,12 @@ if __name__ == "__main__":
     if root not in sys.path:
         sys.path.insert(0, root)
     main()
+
+_RUN_LOGGER = None
+
+
+def _get_run_logger():
+    global _RUN_LOGGER
+    if _RUN_LOGGER is None:
+        _RUN_LOGGER = get_logger()
+    return _RUN_LOGGER
