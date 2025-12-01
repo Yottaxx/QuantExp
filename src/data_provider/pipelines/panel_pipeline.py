@@ -256,20 +256,7 @@ class PanelPipeline:
         df = _attach_static_info(df, info_map)
         df = _attach_fundamentals_pit(df, self.fund_store, code, self.cfg)
 
-        # Alpha factors (per-code)
-        # Alpha factors (per-code) - support multiple AlphaFactory styles
-        try:
-            af = self.AlphaFactory(df)
-            if hasattr(af, "make_factors"):
-                df = af.make_factors()  # type: ignore
-            elif hasattr(af, "calculate_all"):
-                df = af.calculate_all()  # type: ignore
-            elif callable(af):
-                df = af()  # type: ignore
-            else:
-                raise TypeError("AlphaFactory instance lacks make_factors/calculate_all/call")
-        except Exception as e:
-            return None, f"FactorFail({type(e).__name__})"
+        df = af.make_factors()  # type: ignore
 
         pred_len = int(self.cfg.get("PRED_LEN", 5) or 5)
         g = df.groupby("code", sort=False)

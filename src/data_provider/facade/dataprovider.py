@@ -135,11 +135,27 @@ class DataProvider:
         return panel_df, feat_cols
 
     def make_dataset(self, panel_df: pd.DataFrame, feature_cols: List[str]):
-        # Prefer building from parts if available (fix issue #4 for the training path).
-        parts_dir = str(panel_df.attrs.get("parts_dir","") or "").strip()
+        parts_dir = str(panel_df.attrs.get("parts_dir", "") or "").strip()
+
         if parts_dir and os.path.exists(os.path.join(parts_dir, "panel_meta.json")):
-            return self.dataset_pipeline.build_dataset_from_parts(parts_dir)
-        return self.dataset_pipeline.build_dataset(panel_df, feature_cols)
+            ds = self.dataset_pipeline.build_dataset_from_parts(parts_dir)
+        else:
+            ds = self.dataset_pipeline.build_dataset(panel_df, feature_cols)
+
+        # ✅ 新增：给 HF load_from_disk 的落盘（默认打开，可加 cfg 开关）
+        if parts_dir and bool(self.cfg.get("SAVE_HF_DATASET_TO_DISK", True)):
+            out_dir = os.path.join(parts_dir, "hf_dataset")
+            meta = {
+                "adjust": panel_df.attrs.get("adjust"),
+                "mode": panel_df.attrs.get("mode"),
+                "fingerprint": panel_df.attrs.get("fingerprint"),
+                "universe_asof": panel_df.attrs.get("universe_asof"),
+                "created_by": panel_df.attrs.get("created_by"),
+                "feature_cols": feature_cols,
+            }
+            self.dataset_pipeline.save_to_disk_atomic(ds, out_dir, meta=meta)
+            print(f"------save hf dataset tot {out_dir}------")
+        return ds
 
 def get_dataset(force_refresh: bool = False, adjust: str = "qfq"):
     """Backward-compatible helper: returns (DatasetDict, fdim)."""
