@@ -31,6 +31,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from tqdm import tqdm  # noqa: E402
+from utils.logging_utils import get_logger
 
 from .config import Config
 from .data_provider import DataProvider
@@ -38,6 +39,8 @@ from .core.signal_engine import SignalEngine
 
 plt.rcParams["font.sans-serif"] = ["Arial Unicode MS", "SimHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
+
+logger = get_logger()
 
 
 # =============================================================================
@@ -347,20 +350,20 @@ class WalkForwardBacktester:
               - MIN_SCORE_THRESHOLD
               - bear_mean_th=0.45（可改成 Config.MARKET_BEAR_MEAN_TH 之类）
         """
-        print(f"⏳ [Signal Gen] {self.start_date} ~ {self.end_date} (Adjust={self.adjust})")
+        logger.info(f"⏳ [Signal Gen] {self.start_date} ~ {self.end_date} (Adjust={self.adjust})")
 
         # 1) Model
         try:
             model = SignalEngine.load_model(self.model_path)
         except Exception as e:
-            print(f"❌ Model load failed: {e}")
+            logger.error(f"❌ Model load failed: {e}")
             return None
 
         # 2) Panel (Same as analysis)
         try:
             panel_df, feature_cols = SignalEngine.load_panel(adjust=self.adjust, mode="train")
         except Exception as e:
-            print(f"❌ Panel load failed: {e}")
+            logger.error(f"❌ Panel load failed: {e}")
             return None
 
         # 3) Cut window with lookback (ensure first day can be predicted)
@@ -370,7 +373,7 @@ class WalkForwardBacktester:
 
         sub = panel_df[(panel_df["date"] >= read_start.normalize()) & (panel_df["date"] <= read_end.normalize())].copy()
         if sub.empty:
-            print("❌ No panel data for given window.")
+            logger.error("❌ No panel data for given window.")
             return None
 
         # 4) Score range (single source of truth)
@@ -385,7 +388,7 @@ class WalkForwardBacktester:
             desc="WalkForward Scoring",
         )
         if scores_df.empty:
-            print("❌ No scores generated.")
+            logger.error("❌ No scores generated.")
             return None
 
         # 5) Build signal matrix (threshold + bear days)
@@ -406,13 +409,13 @@ class WalkForwardBacktester:
         if signals is None or signals.empty:
             return
 
-        print("🔍 Filtering Active Universe...")
+        logger.info("🔍 Filtering Active Universe...")
         valid_signals = signals.replace(-1, np.nan)
         daily_ranks = valid_signals.rank(axis=1, ascending=False)
         active_mask = (daily_ranks <= int(top_k) * 2).any(axis=0)
         active_codes = signals.columns[active_mask].astype(str).tolist()
 
-        print(f"Active Universe Size: {len(active_codes)}")
+        logger.info(f"Active Universe Size: {len(active_codes)}")
         if not active_codes:
             return
 
@@ -423,7 +426,7 @@ class WalkForwardBacktester:
         cerebro.broker.addcommissioninfo(AShareCommission())
         cerebro.broker.set_slippage_perc(float(getattr(Config, "SLIPPAGE", 0.0)))
 
-        print(f"📂 Loading Market Data ({self.adjust.upper()})...")
+        logger.info(f"📂 Loading Market Data ({self.adjust.upper()})...")
         loaded_cnt = 0
         for code in tqdm(active_codes, desc="LoadData"):
             df_bt = _prepare_bt_price_df(code, self.start_date, self.end_date, self.adjust)
@@ -434,10 +437,10 @@ class WalkForwardBacktester:
             loaded_cnt += 1
 
         if loaded_cnt == 0:
-            print("❌ No valid market data to backtest.")
+            logger.error("❌ No valid market data to backtest.")
             return
 
-        print(f"🚀 Launching Walk-Forward Backtest (Top {top_k})...")
+        logger.info(f"🚀 Launching Walk-Forward Backtest (Top {top_k})...")
         cerebro.addstrategy(
             ModelDrivenStrategy,
             signals=signals,
@@ -463,14 +466,14 @@ class WalkForwardBacktester:
         dd_an = strat.analyzers.drawdown.get_analysis()
         max_dd = dd_an.get("max", {}).get("drawdown", 0.0)
 
-        print("\n" + "=" * 40)
-        print("📊 [Backtest Report]")
-        print(f"Range: {self.start_date} ~ {self.end_date}")
-        print(f"Equity: {self.initial_cash:,.0f} -> {final_val:,.2f}")
-        print(f"Return: {ret:.2%}")
-        print(f"Sharpe: {sharpe:.2f}")
-        print(f"Max DD: {max_dd:.2f}%")
-        print("=" * 40)
+        logger.info("=" * 40)
+        logger.info("📊 [Backtest Report]")
+        logger.info(f"Range: {self.start_date} ~ {self.end_date}")
+        logger.info(f"Equity: {self.initial_cash:,.0f} -> {final_val:,.2f}")
+        logger.info(f"Return: {ret:.2%}")
+        logger.info(f"Sharpe: {sharpe:.2f}")
+        logger.info(f"Max DD: {max_dd:.2f}%")
+        logger.info("=" * 40)
 
         ret_series = pd.Series(strat.analyzers.returns.get_analysis())
         ret_series.index = pd.to_datetime(ret_series.index)
@@ -497,7 +500,7 @@ class WalkForwardBacktester:
         plt.grid(True, linestyle="--", alpha=0.5)
         out_path = os.path.join(Config.OUTPUT_DIR, "walk_forward_result.png")
         plt.savefig(out_path)
-        print(f"📈 Chart saved to {out_path}")
+        logger.info(f"📈 Chart saved to {out_path}")
 
 
 # =============================================================================
@@ -735,30 +738,34 @@ def run_backtest(
     用一个简单 TopK 策略，对若干“代表性个股组合”做有/无费用对比回测。
     top_stocks_list: [(code, score, ...), ...]
     """
-    print(f"\n>>> Launching Validation Backtest (Cash: {float(initial_cash):,.0f}, TopK: {int(top_k)}, Adjust: {adjust})")
+    logger.info(
+        f"\n>>> Launching Validation Backtest (Cash: {float(initial_cash):,.0f}, TopK: {int(top_k)}, Adjust: {adjust})"
+    )
     codes = [str(x[0]) for x in top_stocks_list[: int(top_k)]]
     if not codes:
-        print("❌ Empty stock list.")
+        logger.error("❌ Empty stock list.")
         return
 
-    print("Comparing: Fees & Slippage vs. Frictionless...")
+    logger.info("Comparing: Fees & Slippage vs. Frictionless...")
     res_fees = run_single_backtest(codes, True, float(initial_cash), int(top_k), adjust)
     res_no = run_single_backtest(codes, False, float(initial_cash), int(top_k), adjust)
 
     if not res_fees:
-        print("❌ Backtest Failed (No Data)")
+        logger.error("❌ Backtest Failed (No Data)")
         return
 
-    print(f"{'Metric':<15} | {'Production':<15} | {'Ideal':<15}")
-    print("-" * 50)
-    print(f"{'Equity':<15} | {res_fees['final_value']:<15,.2f} | {res_no['final_value']:<15,.2f}")
-    print(f"{'Return':<15} | {res_fees['profit_rate']:<15.2%} | {res_no['profit_rate']:<15.2%}")
-    print(f"{'Win Rate':<15} | {res_fees['win_rate']:<15.2%} | {res_no['win_rate']:<15.2%}")
-    print("=" * 50)
+    logger.info(f"{'Metric':<15} | {'Production':<15} | {'Ideal':<15}")
+    logger.info("-" * 50)
+    logger.info(f"{'Equity':<15} | {res_fees['final_value']:<15,.2f} | {res_no['final_value']:<15,.2f}")
+    logger.info(f"{'Return':<15} | {res_fees['profit_rate']:<15.2%} | {res_no['profit_rate']:<15.2%}")
+    logger.info(f"{'Win Rate':<15} | {res_fees['win_rate']:<15.2%} | {res_no['win_rate']:<15.2%}")
+    logger.info("=" * 50)
 
     bench = PerformanceAnalyzer.get_benchmark(res_fees["start_date"], res_fees["end_date"])
     if bench is not None:
         m = PerformanceAnalyzer.calculate_metrics(res_fees["returns"], bench)
         if m:
-            print(f"📊 Attribution: Alpha {m['Alpha']:.4f} | Sharpe {m['Sharpe']:.4f} | Excess {(m['Ann. Return'] - m['Benchmark Ret']):.2%}")
+            logger.info(
+                f"📊 Attribution: Alpha {m['Alpha']:.4f} | Sharpe {m['Sharpe']:.4f} | Excess {(m['Ann. Return'] - m['Benchmark Ret']):.2%}"
+            )
             PerformanceAnalyzer.plot_curve(res_fees["returns"], bench)

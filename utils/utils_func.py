@@ -133,6 +133,7 @@ def debug_print_config(
     config_cls: Any,
     only: Optional[Iterable[str]] = None,
     exclude_prefixes: Tuple[str, ...] = ("__",),
+    logger=None,
 ) -> None:
     """
     Print Config.* values (skip callables & dunder).
@@ -152,9 +153,13 @@ def debug_print_config(
 
     keys.sort()
 
-    print("\n" + "=" * 92)
-    print("🧩 Effective Config")
-    print("=" * 92)
+    from utils.logging_utils import get_logger
+
+    log = logger or get_logger()
+
+    log.info("=" * 92)
+    log.info("🧩 Effective Config")
+    log.info("=" * 92)
     for k in keys:
         v = getattr(config_cls, k)
         if isinstance(v, (dict, list, tuple)):
@@ -164,8 +169,8 @@ def debug_print_config(
                 vv = str(v)
         else:
             vv = str(v)
-        print(f"{k:<30} = {vv}")
-    print("=" * 92 + "\n")
+        log.info(f"{k:<30} = {vv}")
+    log.info("=" * 92)
 
 
 def patch_dataprovider_defaults(

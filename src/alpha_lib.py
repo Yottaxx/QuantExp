@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import logging
 import warnings
 from typing import List, Tuple
 
@@ -11,11 +10,12 @@ from scipy.stats import norm
 
 from . import factor_ops as ops
 from .config import Config
+from utils.logging_utils import get_logger
 
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 class AlphaFactory:

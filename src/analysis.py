@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from utils.logging_utils import get_logger
 
 from .config import Config
 from .data_provider import DataProvider
@@ -37,6 +38,8 @@ from .core.signal_engine import SignalEngine  # type: ignore
 
 plt.rcParams["font.sans-serif"] = ["Arial Unicode MS", "SimHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
+
+logger = get_logger()
 
 
 class BacktestAnalyzer:
@@ -116,29 +119,31 @@ class BacktestAnalyzer:
         if self.target_set == "test":
             self.analysis_start_date = splits["test_start"]
             self.analysis_end_date_excl = splits["test_end_excl"]
-            print("\n🔒 [Target: TEST SET] 样本外测试集 (Strict Split, end-exclusive)")
-            print(f"   配置比例: Train({Config.TRAIN_RATIO:.0%}) + Val({Config.VAL_RATIO:.0%}) -> Test")
+            logger.info("🔒 [Target: TEST SET] 样本外测试集 (Strict Split, end-exclusive)")
+            logger.info(f"   配置比例: Train({Config.TRAIN_RATIO:.0%}) + Val({Config.VAL_RATIO:.0%}) -> Test")
 
         elif self.target_set in ["validation", "eval", "val"]:
             self.analysis_start_date = splits["val_start"]
             self.analysis_end_date_excl = splits["val_end_excl"]
-            print("\n🔓 [Target: VALIDATION SET] 验证集 (Strict Split, end-exclusive)")
-            print(f"   配置比例: Train({Config.TRAIN_RATIO:.0%}) -> Val({Config.VAL_RATIO:.0%})")
+            logger.info("🔓 [Target: VALIDATION SET] 验证集 (Strict Split, end-exclusive)")
+            logger.info(f"   配置比例: Train({Config.TRAIN_RATIO:.0%}) -> Val({Config.VAL_RATIO:.0%})")
 
         elif self.target_set == "train":
             self.analysis_start_date = splits["train_start"]
             self.analysis_end_date_excl = splits["train_end_excl"]
-            print("\n📈 [Target: TRAIN SET] 训练集 (In-Sample, end-exclusive)")
+            logger.info("📈 [Target: TRAIN SET] 训练集 (In-Sample, end-exclusive)")
 
         else:
             s_date = self.user_start_date or getattr(Config, "START_DATE", "20000101")
             e_date = self.user_end_date or "2099-12-31"
             self.analysis_start_date = pd.to_datetime(s_date)
             self.analysis_end_date_excl = pd.to_datetime(e_date) + pd.Timedelta(days=1)
-            print("\n🛠️ [Target: CUSTOM] 自定义时间范围 (end-exclusive)")
+            logger.info("🛠️ [Target: CUSTOM] 自定义时间范围 (end-exclusive)")
 
         assert self.analysis_start_date is not None and self.analysis_end_date_excl is not None
-        print(f"   分析区间: {self.analysis_start_date.date()} ~ {(self.analysis_end_date_excl - pd.Timedelta(days=1)).date()}")
+        logger.info(
+            f"   分析区间: {self.analysis_start_date.date()} ~ {(self.analysis_end_date_excl - pd.Timedelta(days=1)).date()}"
+        )
 
     @staticmethod
     def _prev_trading_date(panel_df: pd.DataFrame, end_excl: pd.Timestamp) -> pd.Timestamp:
@@ -154,29 +159,29 @@ class BacktestAnalyzer:
     # =============================================================================
 
     def generate_historical_predictions(self) -> None:
-        print("\n" + "=" * 72)
-        print(f">>> [Analysis] v4 (reuse SignalEngine) (Target: {self.target_set}, Adjust: {self.adjust})")
-        print("=" * 72)
+        logger.info("=" * 72)
+        logger.info(f">>> [Analysis] v4 (reuse SignalEngine) (Target: {self.target_set}, Adjust: {self.adjust})")
+        logger.info("=" * 72)
 
         if not os.path.exists(self.model_path):
-            print(f"❌ 模型未找到: {self.model_path}")
+            logger.error(f"❌ 模型未找到: {self.model_path}")
             return
 
         # 1) Load model/panel via SignalEngine (SSOT)
         try:
             model = SignalEngine.load_model(self.model_path)
         except Exception as e:
-            print(f"❌ Load model failed: {e}")
+            logger.error(f"❌ Load model failed: {e}")
             return
 
         try:
             panel_df, feature_cols = SignalEngine.load_panel(adjust=self.adjust, mode="train")
         except Exception as e:
-            print(f"❌ Load panel failed: {e}")
+            logger.error(f"❌ Load panel failed: {e}")
             return
 
         if panel_df.empty:
-            print("❌ panel_df 为空")
+            logger.error("❌ panel_df 为空")
             return
 
         panel_df = panel_df.copy()
@@ -234,7 +239,7 @@ class BacktestAnalyzer:
         # 4) Score range (REUSE SignalEngine.score_date_range)
         df_scoring = panel_df[(panel_df["date"] >= read_start_date) & (panel_df["date"] <= end_incl)].copy()
         if df_scoring.empty:
-            print("❌ scoring window 为空")
+            logger.error("❌ scoring window 为空")
             return
 
         scores_df = SignalEngine.score_date_range(
@@ -249,7 +254,7 @@ class BacktestAnalyzer:
         )
 
         if scores_df is None or scores_df.empty:
-            print("❌ 未生成 score")
+            logger.error("❌ 未生成 score")
             return
 
         scores_df = scores_df.copy()
@@ -290,7 +295,7 @@ class BacktestAnalyzer:
         self.results_df = merged[["date", "code", "score", "rank_label", "excess_label"]].copy()
         self.results_df = self.results_df.dropna(subset=["date", "code", "score"]).reset_index(drop=True)
 
-        print(f"✅ 推理完成：{len(self.results_df)} 条预测记录。")
+        logger.info(f"✅ 推理完成：{len(self.results_df)} 条预测记录。")
 
         self._price_cache = self._build_price_cache(self._price_df)
 
@@ -606,7 +611,7 @@ class BacktestAnalyzer:
 
     def analyze_performance(self) -> None:
         if self.results_df is None or self.results_df.empty:
-            print("⚠️ 结果集为空（先运行 generate_historical_predictions）")
+            logger.warning("⚠️ 结果集为空（先运行 generate_historical_predictions）")
             return
 
         df = self.results_df.copy()
@@ -615,7 +620,7 @@ class BacktestAnalyzer:
         df["rank_label"] = pd.to_numeric(df["rank_label"], errors="coerce")
         df = df.dropna(subset=["date", "score", "rank_label"]).copy()
         if df.empty:
-            print("⚠️ 清洗后结果集为空（score/rank_label 全 NaN）")
+            logger.warning("⚠️ 清洗后结果集为空（score/rank_label 全 NaN）")
             return
 
         # ---- IC ----
@@ -636,16 +641,16 @@ class BacktestAnalyzer:
             icir = ic_mean / (ic_std + 1e-9) * math.sqrt(252.0)
             ic_win_rate = float((daily_ic > 0).mean())
 
-            print("-" * 60)
-            print(f"📊 【因子绩效(IC)】 (Set: {self.target_set.upper()}, Adjust: {self.adjust})")
-            print("-" * 60)
-            print(f"Rank IC (Mean) : {ic_mean:.4f}")
-            print(f"ICIR (Annual)  : {icir:.4f}")
-            print(f"IC Win Rate    : {ic_win_rate:.2%}")
-            print(f"Days Evaluated : {len(daily_ic)}")
-            print("-" * 60)
+            logger.info("-" * 60)
+            logger.info(f"📊 【因子绩效(IC)】 (Set: {self.target_set.upper()}, Adjust: {self.adjust})")
+            logger.info("-" * 60)
+            logger.info(f"Rank IC (Mean) : {ic_mean:.4f}")
+            logger.info(f"ICIR (Annual)  : {icir:.4f}")
+            logger.info(f"IC Win Rate    : {ic_win_rate:.2%}")
+            logger.info(f"Days Evaluated : {len(daily_ic)}")
+            logger.info("-" * 60)
         else:
-            print(f"⚠️ IC：每日截面样本数不足（<{min_cs}），跳过 IC 统计。")
+            logger.warning(f"⚠️ IC：每日截面样本数不足（<{min_cs}），跳过 IC 统计。")
 
         # ---- strict backtest ----
         if self._price_cache is None:
@@ -658,20 +663,20 @@ class BacktestAnalyzer:
         stats_long = self._calc_stats(bt["ret_long"], rf_annual=rf_annual)
         stats_ls = self._calc_stats(bt["ret_ls"], rf_annual=rf_annual)
 
-        print("-" * 60)
-        print("💼 【严格回测(可交易, 重叠持仓, masks 口径统一)】")
-        print("-" * 60)
-        print(
+        logger.info("-" * 60)
+        logger.info("💼 【严格回测(可交易, 重叠持仓, masks 口径统一)】")
+        logger.info("-" * 60)
+        logger.info(
             f"Long-only:  Total={stats_long['total_return']:.2%}  Ann={stats_long['annual_return']:.2%}  "
             f"Vol={stats_long['annual_vol']:.2%}  Sharpe={stats_long['sharpe']:.2f}  "
             f"MDD={stats_long['max_drawdown']:.2%}  Win={stats_long['win_rate']:.2%}"
         )
-        print(
+        logger.info(
             f"Long-Short: Total={stats_ls['total_return']:.2%}  Ann={stats_ls['annual_return']:.2%}  "
             f"Vol={stats_ls['annual_vol']:.2%}  Sharpe={stats_ls['sharpe']:.2f}  "
             f"MDD={stats_ls['max_drawdown']:.2%}  Win={stats_ls['win_rate']:.2%}"
         )
-        print("-" * 60)
+        logger.info("-" * 60)
 
         self._plot_results(daily_ic, ic_mean, icir, ic_win_rate, bt, stats_long, stats_ls)
 
@@ -714,11 +719,11 @@ class BacktestAnalyzer:
         os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
         save_path = os.path.join(Config.OUTPUT_DIR, f"report_{self.target_set}.png")
         plt.savefig(save_path, dpi=150)
-        print(f"📈 图表已保存至: {save_path}")
+        logger.info(f"📈 图表已保存至: {save_path}")
 
 
 if __name__ == "__main__":
-    print(">>> Mode: Eval Set (QFQ)")
+    logger.info(">>> Mode: Eval Set (QFQ)")
     analyzer = BacktestAnalyzer(target_set="eval", adjust="qfq")
     analyzer.generate_historical_predictions()
     analyzer.analyze_performance()
