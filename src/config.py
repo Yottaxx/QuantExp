@@ -41,13 +41,13 @@ class Config:
     CLASH_SECRET = "b342ba26-2ae3-47bb-a057-6624e171d5c6"
 
     USE_VPN_ROTATOR = True
-    VPN_ROTATE_COOLDOWN_SEC = 60
-    VPN_POST_ROTATE_SLEEP_SEC = 3.0
+    VPN_ROTATE_COOLDOWN_SEC = 5
+    VPN_POST_ROTATE_SLEEP_SEC = 2.5
 
     # AkShare retry
-    AK_RETRIES = 10
-    AK_RETRY_BASE_SLEEP = 1.0
-    AK_RETRY_MAX_SLEEP = 15.0
+    AK_RETRIES = 6
+    AK_RETRY_BASE_SLEEP = 0.8
+    AK_RETRY_MAX_SLEEP = 12
 
     # =============================================================================
     # Market / Calendar

@@ -99,7 +99,7 @@ class InfoPipeline:
             return
 
         self.logger.info(f"🟩 [Info] syncing {len(codes)} codes ...")
-        workers = int(self.cfg.get("PRICE_WORKERS", 16) or 16)
+        workers = int(self.cfg.get("PRICE_WORKERS", 8) or 8)
 
         ok = 0
         bad = 0
